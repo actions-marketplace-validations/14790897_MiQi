@@ -11,7 +11,15 @@ import type { ElectronApplication, Page } from '@playwright/test';
 import { resolve } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { existsSync, mkdtempSync, mkdirSync, cpSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  cpSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -19,7 +27,7 @@ import { existsSync, mkdtempSync, mkdirSync, cpSync, rmSync, readFileSync, write
 export const APPS_DESKTOP = resolve(__dirname, '../../..');
 
 /** Default timeout for real LLM calls */
-export const LLM_TIMEOUT = 240_000;  // 4 min — gives LLM more time in CI
+export const LLM_TIMEOUT = 240_000; // 4 min — gives LLM more time in CI
 
 // ─── Session path helpers ────────────────────────────────────────────
 
@@ -55,36 +63,57 @@ export async function waitForInputReady(page: Page, timeout = 60_000) {
   // Log diagnostic info before throwing
   const count = await textarea.count();
   const containerVisible = await page.locator('[data-testid="chat-input-container"]').isVisible();
-  console.log(`[diagnostic] waitForInputReady failed: textarea count=${count}, container visible=${containerVisible}`);
+  console.log(
+    `[diagnostic] waitForInputReady failed: textarea count=${count}, container visible=${containerVisible}`
+  );
   throw lastError;
 }
 
 /** Send a message and confirm it appears in the chat */
 export async function sendMessage(page: Page, text: string) {
   const textarea = await waitForInputReady(page);
+  const userBubbles = page.getByTestId('chat-message-user');
+  const before = await userBubbles.count();
   await textarea.fill(text);
   await textarea.press('Enter');
-  // Confirm user message appears in chat
-  await expect(page.getByText(text).first()).toBeVisible({ timeout: 10_000 });
+  // The optimistic-UI send (#364) mounts the user bubble immediately and
+  // clears the input BEFORE the backend (providers:list) resolves — so matching
+  // the exact text is unreliable and the reliable signal is a count increase.
+  await expect(userBubbles).toHaveCount(before + 1, { timeout: 10_000 });
+  await expect(userBubbles.last()).toBeVisible({ timeout: 10_000 });
+  await expect(page.locator('[data-testid="chat-input-container"] textarea')).toHaveValue('');
+}
+
+/**
+ * 空会话不再落盘 / 不再进 sessions.list(#774)后,list[0] 不再恒等于刚打开的
+ * 当前空会话。本 helper 保证当前会话已是一条"真实"会话并返回其 key:先查
+ * list,空则发一条 seed 消息(用户消息写入即持久化,不必等 AI 回复)再轮询。
+ * 供那些"launch 后直接取 list[0].key 当当前会话"的 spec 使用。
+ */
+export async function ensurePersistedSession(
+  page: Page,
+  seedText = '请创建会话',
+  timeout = 90_000
+): Promise<string> {
+  const firstKey = async (): Promise<string | undefined> => {
+    const all = (await page.evaluate(() => (window as any).miqi.sessions.list())) as any;
+    return (all?.sessions ?? [])[0]?.key as string | undefined;
+  };
+  let key = await firstKey();
+  if (key) return key;
+  await sendMessage(page, seedText);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    key = await firstKey();
+    if (key) return key;
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`ensurePersistedSession: no session after seeding "${seedText}"`);
 }
 
 /** Wait for streaming to finish (no "Thinking…" indicator) */
 export async function waitForResponseComplete(page: Page, timeout = 120_000) {
-  // Phase 1: model stops generating → "Thinking…" hidden.
-  try {
-    await expect(page.locator('[data-testid="thinking-indicator"]')).toBeHidden({ timeout });
-  } catch (err) {
-    // Dump page state before re-throwing — so CI logs show what the AI
-    // was doing when it got stuck (tool calls, errors, etc.)
-    const mainText = await page.locator('main').textContent();
-    const inProgress = await page.locator('.tag-inprogress').count();
-    console.log('[diagnostic] waitForResponseComplete TIMEOUT — Thinking… still visible after 120s');
-    console.log('[diagnostic] IN PROGRESS tags visible:', inProgress);
-    console.log('[diagnostic] main textContent (last 1500 chars):', (mainText || '').slice(-1500));
-    throw err;
-  }
-
-  // Phase 2: if the AI used tools, "IN PROGRESS" stays visible while
+  // Phase 1: if the AI used tools, "IN PROGRESS" stays visible while
   // the tool runs.  Wait for it to hide (tool result rendered).
   try {
     await expect(page.locator('.tag-inprogress')).toBeHidden({ timeout: 15_000 });
@@ -92,53 +121,80 @@ export async function waitForResponseComplete(page: Page, timeout = 120_000) {
     // Fast responses may never show IN PROGRESS.
   }
 
-  // Phase 3: wait for textContent to stop changing (streaming done).
-  //
-  // Capture the baseline after the thinking indicator is hidden so we
-  // only watch for *new* output from the AI's final response (after any
-  // tool calls).  Each call resets __miqi_stream_state to prevent
-  // cross-test leakage.
+  // Phase 2: wait for main textContent to stop changing (streaming done).
+  // Tolerate small growth (a "已深度思考 · N 秒" live timer adds a few chars
+  // per second); a large jump means the reply is still streaming.
   await page.evaluate(() => {
     const main = document.querySelector('main');
     (window as any).__miqi_stream_state = { base: (main?.textContent || '').length, stable: 0 };
   });
 
-  // Two consecutive 400ms polls with no length change → response is
-  // complete.  Allow up to 30s; the old 5s window was too tight for
-  // slow streaming starts (e.g. after tool output).
-  await page.waitForFunction(() => {
-    const main = document.querySelector('main');
-    if (!main) return false;
-    const text = main.textContent || '';
-    const s = (window as any).__miqi_stream_state;
-    if (!s) {
-      (window as any).__miqi_stream_state = { base: text.length, stable: 0 };
-      return false;
-    }
-    if (text.length !== s.base) {
-      s.base = text.length;
-      s.stable = 0;
-      return false;
-    }
-    s.stable++;
-    return s.stable >= 2;
-  }, { timeout: 30000, polling: 200 });
+  await page.waitForFunction(
+    () => {
+      const main = document.querySelector('main');
+      if (!main) return false;
+      const text = main.textContent || '';
+      const s = (window as any).__miqi_stream_state;
+      if (!s) {
+        (window as any).__miqi_stream_state = { base: text.length, stable: 0 };
+        return false;
+      }
+      if (text.length - s.base >= 10) {
+        s.base = text.length;
+        s.stable = 0;
+        return false;
+      }
+      s.stable++;
+      return s.stable >= 2;
+      // Respect the caller's timeout: CI LLM providers have been slow enough
+      // that PR-Agent's ai_timeout was raised to 600s (#707).  The old
+      // Math.min(timeout, 90_000) cap made 240s callers time out at 90s and
+      // deterministically fail LLM-dependent tests like regression-480.
+    },
+    { timeout, polling: 200 }
+  );
 }
 
 /** Poll for approval dialogs and click "永久允许" until the AI stops
  *  thinking.  Used by sandbox and session-isolation tests. */
 export async function approveLoop(page: Page, timeout = 180_000) {
+  // The thinking indicator was removed, so completion can't be detected via
+  // [data-testid="thinking-indicator"].  Keep auto-approving any dialogs, and
+  // consider the turn done when main's textContent stops growing (tolerating
+  // a small live-timer delta so the "已深度思考 · N 秒" counter doesn't block
+  // completion).
   const deadline = Date.now() + timeout;
+  let lastLen = -1;
+  let stable = 0;
+  let started = false;
   while (Date.now() < deadline) {
     const btn = page.getByTestId('approval-allow-permanent');
     if (await btn.isVisible({ timeout: 1000 }).catch(() => false)) {
       await btn.click();
       console.log('[test] Auto-approved tool');
     }
-    const thinking = await page.getByTestId('thinking-indicator').isVisible().catch(() => false);
-    if (!thinking) break;
+    const text = await page
+      .locator('main')
+      .textContent()
+      .catch(() => '');
+    const len = text ? text.length : 0;
+    if (len > 0) started = true;
+    // Allow small growth (a live timer adds a few chars per second); a large
+    // jump means the reply is still streaming.
+    if (lastLen === -1 || Math.abs(len - lastLen) < 10) {
+      stable += 1;
+      if (stable >= 3) return; // content stable → reply done
+    } else {
+      stable = 0;
+    }
+    lastLen = len;
     await page.waitForTimeout(1000);
   }
+  throw new Error(
+    started
+      ? 'approveLoop timed out before the response completed'
+      : 'approveLoop timed out before the response started'
+  );
 }
 
 // ─── Session / Sidebar helpers ──────────────────────────────────────
@@ -148,6 +204,19 @@ export async function approveLoop(page: Page, timeout = 180_000) {
  *  UI share font-semibold.truncate on the title h2. */
 export function getSessionTitle(page: Page) {
   return page.locator('h2.font-semibold.truncate').first();
+}
+
+/** Locator for the user message bubble containing `text` (substring match).
+ *  Scoped to `[data-testid="chat-message-user"]` (not `main`) and visible-only:
+ *  the session title is auto-derived from the first user message, so the same
+ *  marker text also lives in the header's `chat-title`, which a `main`-scoped
+ *  `.first()` would hit before the message list.  The `visible: true` filter is
+ *  a defensive guard against stale/hidden nodes (#872). */
+export function userMessage(page: Page, text: string) {
+  return page
+    .locator('[data-testid="chat-message-user"]')
+    .filter({ hasText: text, visible: true })
+    .first();
 }
 
 /** Get sidebar session items (clickable buttons that switch sessions).
@@ -201,10 +270,7 @@ export async function waitForSidebarRefresh(page: Page, _timeout = 10_000) {
 /** Switch to a sidebar session by clicking through sessions until the
  *  given marker text becomes visible in the main chat area.
  *  No longer depends on a "对话" nav button — the sidebar is always visible. */
-export async function switchToSessionWithMarker(
-  page: Page,
-  marker: string,
-): Promise<boolean> {
+export async function switchToSessionWithMarker(page: Page, marker: string): Promise<boolean> {
   // Ensure the Tasks section is scrolled into view
   const tasksHeader = page.locator('[data-testid="nav-tasks-title"]');
   await tasksHeader.scrollIntoViewIfNeeded().catch(() => {});
@@ -232,9 +298,7 @@ export async function switchToSessionWithMarker(
   }
 
   const count = await items.count();
-  console.log(
-    `[test] Searching ${count} sidebar sessions for marker: ${marker}`,
-  );
+  console.log(`[test] Searching ${count} sidebar sessions for marker: ${marker}`);
 
   for (let i = 0; i < count; i++) {
     const btn = items.nth(i);
@@ -260,7 +324,7 @@ export async function switchToSessionWithMarker(
           return text !== prev && text.length > 0;
         },
         prevTitle ?? '',
-        { timeout: 5_000, polling: 200 },
+        { timeout: 5_000, polling: 200 }
       );
     } catch {
       // Title didn't change — session may not have loaded, or this is
@@ -288,7 +352,7 @@ export async function switchToSessionWithMarker(
     const pollTimeout = titleHasMarker ? 120_000 : 15_000;
     if (titleHasMarker) {
       console.log(
-        `[test] Title confirms this is the right session — waiting up to ${pollTimeout / 1000}s for history to render`,
+        `[test] Title confirms this is the right session — waiting up to ${pollTimeout / 1000}s for history to render`
       );
     }
 
@@ -301,15 +365,13 @@ export async function switchToSessionWithMarker(
       // Marker not visible here — try the next sidebar session.
       if (titleHasMarker) {
         console.log(
-          `[test] Session #${i} title matched but marker did not appear in ${pollTimeout / 1000}s — continuing search`,
+          `[test] Session #${i} title matched but marker did not appear in ${pollTimeout / 1000}s — continuing search`
         );
       }
     }
   }
 
-  console.log(
-    `[test] Marker "${marker}" not found in any of ${count} sessions`,
-  );
+  console.log(`[test] Marker "${marker}" not found in any of ${count} sessions`);
   return false;
 }
 
@@ -322,7 +384,9 @@ export async function waitForBridgeInitialized(page: Page, timeoutS = 30) {
       try {
         const s = await (window as any).miqi.runtime.status();
         if (s?.state === 'running' && s?.initialized) return;
-      } catch { /* preload not injected yet */ }
+      } catch {
+        /* preload not injected yet */
+      }
       await new Promise((r) => setTimeout(r, 1000));
     }
   }, timeoutS);
@@ -350,10 +414,14 @@ export async function waitForSandboxReady(page: Page, timeoutMs = 300_000): Prom
       // Log progress every 30s so CI logs show we're not hung
       const elapsed = Math.round((timeoutMs - (deadline - Date.now())) / 1000);
       if (elapsed - lastLog >= 30) {
-        console.log(`[test] Waiting for sandbox... ${elapsed}s elapsed (state: ${status?.state}, sandbox_available: ${status?.sandbox_available})`);
+        console.log(
+          `[test] Waiting for sandbox... ${elapsed}s elapsed (state: ${status?.state}, sandbox_available: ${status?.sandbox_available})`
+        );
         lastLog = elapsed;
       }
-    } catch { /* bridge not ready yet */ }
+    } catch {
+      /* bridge not ready yet */
+    }
     await page.waitForTimeout(2000);
   }
   console.log('[test] Warning: sandbox not ready within timeout');
@@ -375,9 +443,15 @@ export interface ElectronFixture {
  *
  *  - Creates a unique temporary MIQI_HOME so parallel test workers are fully isolated.
  *  - Strips ELECTRON_RUN_AS_NODE (inherited from Electron-based IDEs).
- *  - Waits for MiQi Workbench UI + bridge runtime.status() === 'running'.
+ *  - Waits for the MiQroForge main UI + bridge runtime.status() === 'running'.
+ *  - `patchConfig` (optional) mutates the temp-home config JSON before it is
+ *    written — used by specs that need a custom provider endpoint (e.g. the
+ *    confirm-card spec points deepseek at a local mock OpenAI server).
  */
-export async function launchElectronApp(): Promise<ElectronFixture> {
+export async function launchElectronApp(
+  patchConfig?: (config: any) => any,
+  opts?: { bypassAll?: boolean; noConsentBypass?: boolean }
+): Promise<ElectronFixture> {
   // Create unique temporary home per test worker for full isolation.
   // Parallel workers each get their own MIQI_HOME → no race on sessions/.
   const miqiHome = mkdtempSync(join(tmpdir(), 'miqi-e2e-'));
@@ -397,7 +471,20 @@ export async function launchElectronApp(): Promise<ElectronFixture> {
   const config = existsSync(destConfigPath)
     ? JSON.parse(readFileSync(destConfigPath, 'utf-8'))
     : {};
-  config.approvals = { ...config.approvals, bypass_all: true };
+  if (patchConfig) patchConfig(config);
+  const bypassAll = opts?.bypassAll ?? true;
+  if (bypassAll) {
+    config.approvals = { ...config.approvals, bypass_all: true };
+  } else {
+    // A spec that verifies approval cards must opt out of the global bypass.
+    // The user's config.json stores camelCase keys (bypassAll) and the app
+    // schema accepts both — delete BOTH forms so the bridge never sees an
+    // approval bypass.
+    delete config.approvals?.bypass_all;
+    delete config.approvals?.bypassAll;
+    delete config.approvals?.bypass_file_write_approval;
+    delete config.approvals?.bypassFileWriteApproval;
+  }
   // ── E2E: always disable feedback channel so tests don't hit real Feishu ──
   // Each test that needs feedback enabled can opt in by patching the config
   // after launchElectronApp.  Default OFF keeps the disabled-error path
@@ -414,9 +501,42 @@ export async function launchElectronApp(): Promise<ElectronFixture> {
   const env: Record<string, string | undefined> = { ...process.env };
   env.MIQI_HOME = miqiHome;
   delete env.ELECTRON_RUN_AS_NODE;
+  // E2E default: set MIQI_E2E so the main process skips the #837 privacy-consent
+  // gate (fresh userData has no stored consent). The privacy-consent spec opts
+  // out via noConsentBypass to exercise the gate itself.
+  if (opts?.noConsentBypass) {
+    delete env.MIQI_E2E;
+  } else {
+    env.MIQI_E2E = '1';
+  }
+
+  // The bridge is spawned per E2E run (cold start).  If MIQI_PYTHON_PATH
+  // points at a python that cannot even run (e.g. a stale uv-managed
+  // interpreter whose executable is gone), findBridgeExecutable() picks it
+  // first and the bridge dies at startup → the app shows "离线 MiQroForge 智能体"
+  // and never streams.  Clear it so the bridge falls back to `uv run python`
+  // (which resolves the current repo's venv) and actually boots.
+  if (env.MIQI_PYTHON_PATH) {
+    const probe = require('node:child_process').spawnSync(
+      env.MIQI_PYTHON_PATH,
+      ['-c', 'import sys; sys.exit(0)'],
+      { encoding: 'utf8', timeout: 5000, windowsHide: true }
+    );
+    if (probe.status !== 0) {
+      console.log(
+        `[test] MIQI_PYTHON_PATH unusable (status ${probe.status}) — clearing so bridge uses the repo venv`
+      );
+      delete env.MIQI_PYTHON_PATH;
+    }
+  }
+
+  // Isolated Electron userData per launch: without it every test instance
+  // (and the dev app) shares the default profile, so sessions/UI state leak
+  // between runs and tests "continue" a previous conversation (#721 实测).
+  const userDataDir = join(miqiHome, 'userdata');
 
   const electronApp = await electron.launch({
-    args: [APPS_DESKTOP],
+    args: [`--user-data-dir=${userDataDir}`, APPS_DESKTOP],
     executablePath: require('electron') as string,
     env: env as Record<string, string>,
     // chromiumSandbox: false covers --no-sandbox + --disable-gpu
@@ -424,18 +544,21 @@ export async function launchElectronApp(): Promise<ElectronFixture> {
     chromiumSandbox: false,
   });
 
-  // Wait for the main window (skip splash window — 480x100, title "MiQi")
+  // Wait for the main window (skip splash window — 480x100, title "MiQroForge")
   let page;
   for (let i = 0; i < 100; i++) {
     const windows = electronApp.windows();
     for (const w of windows) {
       try {
         const info = await w.evaluate(() => ({ t: document.title, w: window.outerWidth }));
-        if (info.w > 500 && info.t === 'MiQi Desktop') { page = w; break; }
+        if (info.w > 500 && info.t === 'MiQroForge Desktop') {
+          page = w;
+          break;
+        }
       } catch {}
     }
     if (page) break;
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 100));
   }
   if (!page) page = await electronApp.firstWindow();
   await page.waitForLoadState('domcontentloaded');
@@ -448,15 +571,23 @@ export async function launchElectronApp(): Promise<ElectronFixture> {
       t.includes('[MIQI BRIDGE STDERR]') ||
       t.includes('[miqi-bridge]') ||
       t.includes('[Bridge]') ||
-      t.includes('[MiQi]') ||
+      t.includes('[MiQroForge]') ||
       t.includes('[e2e]')
     ) {
       console.log(`[e2e-console] ${t}`);
     }
   });
 
+  // With noConsentBypass the app is parked on the privacy-consent gate —
+  // app-title / chat input never mount, so skip the UI-readiness tail and
+  // let the spec drive the gate interaction itself.
+  if (opts?.noConsentBypass) {
+    console.log('[test] Launched with consent gate (no MIQI_E2E)');
+    return { electronApp, page, miqiHome, miqiSessionsDir };
+  }
+
   try {
-    await page.getByText('MiQi Workbench').waitFor({ timeout: 30_000 });
+    await page.getByTestId('app-title').waitFor({ timeout: 30_000 });
     console.log('[test] App UI loaded');
   } catch {
     console.log('[test] App UI may still be loading — continuing');
@@ -475,8 +606,7 @@ export async function launchElectronApp(): Promise<ElectronFixture> {
     }
     return false;
   });
-  if (!bridgeReady)
-    console.log('[test] Warning: bridge did not reach running state');
+  if (!bridgeReady) console.log('[test] Warning: bridge did not reach running state');
 
   // Now wait for the input to be ready
   await waitForInputReady(page, 60_000);
@@ -494,6 +624,7 @@ export async function launchElectronApp(): Promise<ElectronFixture> {
  *  run doesn't hang on dialogs or hit real feedback channels. */
 export async function relaunchElectronApp(
   miqiHome: string,
+  opts?: { noConsentBypass?: boolean }
 ): Promise<ElectronFixture> {
   const miqiSessionsDir = getMiqiSessionsDir(miqiHome);
 
@@ -513,9 +644,34 @@ export async function relaunchElectronApp(
   const env: Record<string, string | undefined> = { ...process.env };
   env.MIQI_HOME = miqiHome;
   delete env.ELECTRON_RUN_AS_NODE;
+  // Same #837 consent-gate bypass logic as launchElectronApp (see above).
+  if (opts?.noConsentBypass) {
+    delete env.MIQI_E2E;
+  } else {
+    env.MIQI_E2E = '1';
+  }
+  // Same broken-MIQI_PYTHON_PATH fallback as launchElectronApp (see above).
+  if (env.MIQI_PYTHON_PATH) {
+    const relaunchProbe = require('node:child_process').spawnSync(
+      env.MIQI_PYTHON_PATH,
+      ['-c', 'import sys; sys.exit(0)'],
+      { encoding: 'utf8', timeout: 5000, windowsHide: true }
+    );
+    if (relaunchProbe.status !== 0) {
+      console.log(
+        `[test] (relaunch) MIQI_PYTHON_PATH unusable — clearing so bridge uses the repo venv`
+      );
+      delete env.MIQI_PYTHON_PATH;
+    }
+  }
+
+  // Isolated Electron userData per launch: without it every test instance
+  // (and the dev app) shares the default profile, so sessions/UI state leak
+  // between runs and tests "continue" a previous conversation (#721 实测).
+  const userDataDir = join(miqiHome, 'userdata');
 
   const electronApp = await electron.launch({
-    args: [APPS_DESKTOP],
+    args: [`--user-data-dir=${userDataDir}`, APPS_DESKTOP],
     executablePath: require('electron') as string,
     env: env as Record<string, string>,
     chromiumSandbox: false,
@@ -527,7 +683,10 @@ export async function relaunchElectronApp(
     for (const w of windows) {
       try {
         const info = await w.evaluate(() => ({ t: document.title, w: window.outerWidth }));
-        if (info.w > 500 && info.t === 'MiQi Desktop') { page = w; break; }
+        if (info.w > 500 && info.t === 'MiQroForge Desktop') {
+          page = w;
+          break;
+        }
       } catch {}
     }
     if (page) break;
@@ -543,15 +702,21 @@ export async function relaunchElectronApp(
       t.includes('[MIQI BRIDGE STDERR]') ||
       t.includes('[miqi-bridge]') ||
       t.includes('[Bridge]') ||
-      t.includes('[MiQi]') ||
+      t.includes('[MiQroForge]') ||
       t.includes('[e2e]')
     ) {
       console.log(`[e2e-console] ${t}`);
     }
   });
 
+  // Same as launchElectronApp: parked on the consent gate, no UI tail.
+  if (opts?.noConsentBypass) {
+    console.log('[test] Relaunched with consent gate (no MIQI_E2E)');
+    return { electronApp, page, miqiHome, miqiSessionsDir };
+  }
+
   try {
-    await page.getByText('MiQi Workbench').waitFor({ timeout: 30_000 });
+    await page.getByTestId('app-title').waitFor({ timeout: 30_000 });
     console.log('[test] App UI loaded (relaunch)');
   } catch {
     console.log('[test] App UI may still be loading — continuing');
@@ -571,8 +736,7 @@ export async function relaunchElectronApp(
     }
     return false;
   });
-  if (!bridgeReady)
-    console.log('[test] Warning: bridge did not reach running state (relaunch)');
+  if (!bridgeReady) console.log('[test] Warning: bridge did not reach running state (relaunch)');
 
   console.log('[test] Ready (relaunch)');
   return { electronApp, page, miqiHome, miqiSessionsDir };
@@ -587,7 +751,7 @@ export async function relaunchElectronApp(
 export async function closeElectronApp(
   app: ElectronApplication,
   miqiHome?: string,
-  keepHome = false,
+  keepHome = false
 ) {
   if (app) {
     // Bound the close: some tests leave an in-flight LLM/bridge request
@@ -608,7 +772,24 @@ export async function closeElectronApp(
     ]);
   }
   if (miqiHome && !keepHome && existsSync(miqiHome)) {
-    rmSync(miqiHome, { recursive: true, force: true });
-    console.log(`[test] Cleaned up MIQI_HOME: ${miqiHome}`);
+    // The bridge may still be tearing down children (exec bash/curl) whose
+    // cwd lives under miqiHome — Windows refuses to delete a directory that
+    // a dying process still holds.  Retry briefly instead of failing the
+    // spec on a cleanup race.
+    let cleaned = false;
+    for (let i = 0; i < 8 && !cleaned; i++) {
+      try {
+        rmSync(miqiHome, { recursive: true, force: true });
+        cleaned = true;
+      } catch (e: any) {
+        if (e?.code !== 'EPERM' && e?.code !== 'EBUSY') throw e;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+    console.log(
+      cleaned
+        ? `[test] Cleaned up MIQI_HOME: ${miqiHome}`
+        : `[test] MIQI_HOME cleanup gave up: ${miqiHome}`
+    );
   }
 }

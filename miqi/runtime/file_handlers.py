@@ -42,7 +42,6 @@ from miqi.runtime.fs_protocol import decode_data_base64, encode_data_base64
 from miqi.session.manager import OwnershipError
 from miqi.utils.helpers import safe_filename
 
-
 # ── workspace / SessionManager access ──────────────────────────────────────
 
 
@@ -179,7 +178,8 @@ def _validate_file_path(
                 file_path = str(candidate.relative_to(workspace.resolve()))
             except ValueError:
                 raise AppServerError(
-                    f"Path is outside workspace: {file_path}",
+                    f"Path is outside workspace: {file_path}"
+                    "（工作区外的文件请改用 exec 命令读取）",
                     code="INVALID_PARAMS",
                 )
 
@@ -199,7 +199,9 @@ def _validate_file_path(
     resolved = (workspace / file_path).resolve()
     if not str(resolved).startswith(str(workspace) + str(Path("/"))) and resolved != workspace:
         raise AppServerError(
-            f"Path escapes workspace: {file_path}", code="INVALID_PARAMS",
+            f"Path escapes workspace: {file_path}"
+            "（工作区外的文件请改用 exec 命令读取）",
+            code="INVALID_PARAMS",
         )
     return resolved
 
@@ -220,10 +222,45 @@ _ALLOWED_NAMES: set[str] = {
 
 _BINARY_VIEWABLE_SUFFIXES: set[str] = {
     ".pdf",
+    # Images — 附件内联显示 + 跨 session 恢复 (#659)，与 document_parser
+    # 的 _SUFFIX_TO_MIME 保持一致
+    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif", ".ico",
+    # SVG 矢量图 — graph_render 工具产物内联展示 (#715)
+    ".svg",
+}
+
+# Office 后缀只在显式 as_binary=true 时可读（issue #877「下载/另存为」需
+# 要原始字节）；不加入 _BINARY_VIEWABLE_SUFFIXES，避免工作区编辑器对它们
+# 也走 iframe blob 路径（Chromium 无法渲染 xlsx/docx）。
+_BINARY_READABLE_SUFFIXES: set[str] = _BINARY_VIEWABLE_SUFFIXES | {
+    ".xlsx", ".xls", ".ods",
+    ".docx", ".doc", ".odt",
+    ".pptx", ".ppt", ".odp",
+    ".csv",
 }
 
 _SUFFIX_TO_MIME: dict[str, str] = {
     ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".odp": "application/vnd.oasis.opendocument.presentation",
+    ".csv": "text/csv",
 }
 
 _TREE_SKIP_SUFFIXES: set[str] = {
@@ -238,15 +275,6 @@ _TREE_SKIP_SUFFIXES: set[str] = {
 
 _TEXT_SAFE_SUFFIXES = _ALLOWED_SUFFIXES
 _TEXT_SAFE_NAMES = _ALLOWED_NAMES
-
-
-def _check_text_file_type(resolved: Path) -> None:
-    """Raise AppServerError if the file is not a text-like type."""
-    if resolved.suffix not in _TEXT_SAFE_SUFFIXES and resolved.name not in _TEXT_SAFE_NAMES:
-        raise AppServerError(
-            f"File type not supported: {resolved.suffix or resolved.name}",
-            code="INVALID_PARAMS",
-        )
 
 
 # ── files.tree ─────────────────────────────────────────────────────────────
@@ -508,6 +536,12 @@ async def files_read_handler(
     """
     file_path = params.get("path", "").strip()
     session_key = params.get("session_key")
+    # #776：svg 等同时属文本安全集与二进制可读集的后缀，默认走二进制
+    # 分支（前端内联展示需 data_base64/mime_type）；调用方想读纯文本
+    # 时显式传 as_text=true 强制走文本分支。
+    as_text = bool(params.get("as_text"))
+    # #877：显式请求原始字节（「下载/另存为」需要 Office 文件字节）。
+    as_binary = bool(params.get("as_binary"))
 
     logger.info(
         "[files:read] req={} path={} session_key={} client={}",
@@ -559,7 +593,14 @@ async def files_read_handler(
             raise AppServerError(f"Path is a directory: {file_path}", code="INVALID_PARAMS")
 
     suffix = resolved.suffix.lower()
-    if suffix in _TEXT_SAFE_SUFFIXES or resolved.name in _TEXT_SAFE_NAMES:
+    # 二进制可读后缀（含 .svg）优先：svg 同时属于文本安全集（.svg 在
+    # _ALLOWED_SUFFIXES）与二进制可读集——文本分支先命中会返回纯文本
+    # content，前端内联展示需要 data_base64/mime_type（CodeRabbit #761）。
+    # as_text=true（#776）显式请求纯文本时例外，svg 走文本分支。
+    # as_binary=true（#877）时对 Office 后缀等也走二进制分支。
+    in_text_safe = suffix in _TEXT_SAFE_SUFFIXES or resolved.name in _TEXT_SAFE_NAMES
+    want_binary = as_binary and suffix in _BINARY_READABLE_SUFFIXES
+    if in_text_safe and (suffix not in _BINARY_VIEWABLE_SUFFIXES or as_text) and not want_binary:
         # ── text file ──────────────────────────────────────────────────
         try:
             if wsl_distro:
@@ -585,7 +626,7 @@ async def files_read_handler(
             },
         }
 
-    if suffix in _BINARY_VIEWABLE_SUFFIXES:
+    if suffix in _BINARY_VIEWABLE_SUFFIXES or want_binary:
         # ── binary file — return base64 ───────────────────────────────
         try:
             if wsl_distro:

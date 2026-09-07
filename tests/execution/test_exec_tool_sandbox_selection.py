@@ -18,7 +18,6 @@ from miqi.protocol.permissions import (
     NetworkSandboxPolicy,
 )
 
-
 # ── helpers ────────────────────────────────────────────────────────────
 
 def _make_selection(
@@ -249,7 +248,7 @@ async def test_sandbox_selection_landlock_unsupported():
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
+    assert "未执行" in result
     assert "LANDLOCK" in result
 
 
@@ -427,7 +426,7 @@ async def test_sandbox_selection_timeout_ms_consumed():
         _sandbox=sel,
     )
 
-    assert "timed out" in result.lower()
+    assert "超时" in result
 
 
 @pytest.mark.asyncio
@@ -442,7 +441,7 @@ async def test_sandbox_selection_timeout_ms_not_exceeded():
     )
 
     assert "completed" in result
-    assert "timed out" not in result.lower()
+    assert "超时" not in result
 
 
 # ── 31.3: SandboxSelection.env_passthrough enforcement ─────────────────
@@ -537,8 +536,8 @@ async def test_restricted_cwd_outside_workspace_fails(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside" in result.lower() or "workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -591,11 +590,84 @@ def test_sandbox_selection_includes_env_passthrough():
 # ── 31.3: SandboxPolicyEngine allow_fallback_to_none ───────────────────
 
 @pytest.mark.asyncio
+async def test_sandbox_policy_dynamic_bwrap_available_live():
+    """#875 产品发现：bwrap_available 传 callable 时每次 select() 实时求值。
+
+    沙箱管理器初始化是 ready 信号后的异步后台任务——会话创建早于初始化时，
+    冻结的 False 会让该会话的 exec 永远落到 NONE（宿主机无隔离直连），
+    沙箱就绪后也拿不到 BWRAP 保护。callable 一旦翻转为 True，既有会话的
+    下一次 exec 立即获得 BWRAP 选择。
+    """
+    from miqi.execution.sandbox_policy import (
+        SandboxPolicyEngine,
+    )
+
+    state = {"initialized": False}
+
+    def _provider() -> bool:
+        return state["initialized"]
+
+    engine = SandboxPolicyEngine(bwrap_available=_provider)
+
+    class FakeCtx:
+        tool_name = "exec"
+        arguments = {"command": "apt-get install -y x"}
+
+    # 沙箱未就绪 → NONE（无隔离直连，此时沙箱确实不可用）
+    sel1 = await engine.select(FakeCtx())
+    assert sel1.sandbox_type == SandboxType.NONE
+
+    # 沙箱异步初始化完成（模拟 _init_sandbox_manager 结束）→ 既有会话立即
+    # 获得 BWRAP 保护——无需重建会话/重启
+    state["initialized"] = True
+    sel2 = await engine.select(FakeCtx())
+    assert sel2.sandbox_type == SandboxType.BWRAP
+
+
+@pytest.mark.asyncio
+async def test_sandbox_enabled_no_silent_host_fallback():
+    """#875 第二轮评估（B7 不变量）：沙箱开启但 bwrap 不可用 → 拒绝，绝不 NONE。
+
+    NONE（宿主机执行）只允许来自显式的沙箱关闭——allow_fallback_to_none
+    传 callable 表达用户意图：开启 → False（拒绝）；关闭 → True（允许）。
+    """
+    from miqi.execution.sandbox_policy import (
+        SandboxDeniedError,
+        SandboxPolicyEngine,
+    )
+
+    state = {"enabled": True}
+
+    def _fallback() -> bool:
+        return not state["enabled"]
+
+    engine = SandboxPolicyEngine(
+        bwrap_available=False,  # 沙箱不可用（初始化窗口/失败）
+        allow_fallback_to_none=_fallback,
+    )
+
+    class FakeCtx:
+        tool_name = "exec"
+        arguments = {"command": "apt-get install -y x"}
+
+    # 沙箱开启 + bwrap 不可用 → 绝不静默降级到宿主机
+    with pytest.raises(SandboxDeniedError):
+        await engine.select(FakeCtx())
+
+    # 用户显式关闭沙箱 → NONE（宿主机模式是显式选择，护栏兜底）
+    state["enabled"] = False
+    sel = await engine.select(FakeCtx())
+    assert sel.sandbox_type == SandboxType.NONE
+
+
+# ── 31.3: PermissionProfile fields in SandboxSelection path ────────────
+
+@pytest.mark.asyncio
 async def test_sandbox_policy_no_fallback_fails_on_exhaustion():
     """SandboxPolicyEngine with allow_fallback_to_none=False raises SandboxDeniedError."""
     from miqi.execution.sandbox_policy import (
-        SandboxPolicyEngine,
         SandboxDeniedError,
+        SandboxPolicyEngine,
     )
 
     engine = SandboxPolicyEngine(
@@ -619,8 +691,8 @@ async def test_sandbox_policy_no_fallback_fails_on_exhaustion():
 async def test_permission_profile_filesystem_mode_in_sandbox_selection():
     """When PermissionProfile has filesystem_mode, it should be reflected
     in or at least compatible with the SandboxSelection."""
-    from miqi.runtime.permission_profile import PermissionProfile
     from miqi.execution.sandbox_policy import SandboxPolicyEngine
+    from miqi.runtime.permission_profile import PermissionProfile
 
     profile = PermissionProfile(
         workspace=None,  # type: ignore
@@ -665,8 +737,8 @@ async def test_restricted_cwd_enforced_even_without_restrict_config(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside" in result.lower() or "workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -699,8 +771,8 @@ async def test_restricted_no_working_dir_fails_closed():
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "workspace" in result.lower()
+    assert "未执行" in result
+    assert "工作区" in result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -722,8 +794,8 @@ async def test_restricted_rejects_outside_windows_absolute_path(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -739,8 +811,8 @@ async def test_restricted_rejects_outside_posix_absolute_path(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -755,8 +827,8 @@ async def test_restricted_rejects_wsl_absolute_path(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -810,8 +882,8 @@ async def test_restricted_rejects_traversal_path(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -827,8 +899,11 @@ async def test_restricted_rejects_redirect_to_outside(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    # Issue #811: the capability guard now intercepts this BEFORE the
+    # RESTRICTED enforcement, with a structured refusal (沙箱护栏拦截);
+    # the RESTRICTED path ("命令未执行") remains as the fallback.
+    assert "未执行" in result or "沙箱护栏拦截" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -844,8 +919,9 @@ async def test_restricted_rejects_append_redirect_to_outside(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    # Issue #811: structured guard refusal before RESTRICTED enforcement.
+    assert "未执行" in result or "沙箱护栏拦截" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -861,8 +937,56 @@ async def test_restricted_rejects_input_redirect_from_outside(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
+
+
+@pytest.mark.asyncio
+async def test_bwrap_fallback_requards_with_host_semantics(tmp_path):
+    """BWRAP selection with no live sandbox → the host fallback must
+    re-check the guard with HOST path semantics (issue #811 review).
+
+    The pre-flight guard ran with sandbox semantics (BWRAP selected) and
+    allowed the sandbox-internal path /home/miqi/...; on the host that
+    is a REAL path, so the fallback must refuse it instead of executing
+    against the wrong filesystem.
+    """
+    tool = ExecTool(timeout=5, working_dir=str(tmp_path))
+    sel = _make_selection(SandboxType.BWRAP)
+
+    result = await tool.execute(
+        "rm -rf /home/miqi/workspace/x",
+        working_dir=str(tmp_path),
+        _sandbox=sel,
+    )
+    assert "沙箱护栏拦截" in result
+
+
+class _FakeActiveSandbox:
+    is_running = True
+
+
+class _FakeManagerWithActiveSandbox:
+    def __init__(self):
+        self.active_sandbox = _FakeActiveSandbox()
+
+
+@pytest.mark.asyncio
+async def test_none_selection_keeps_host_semantics_with_active_sandbox(tmp_path):
+    """NONE/RESTRICTED selections execute on the HOST — the guard must
+    use host path semantics even when the manager holds an active
+    sandbox (issue #811 review)."""
+    tool = ExecTool(
+        timeout=5, working_dir=str(tmp_path),
+        sandbox_manager=_FakeManagerWithActiveSandbox(),
+    )
+    for st in (SandboxType.NONE, SandboxType.RESTRICTED):
+        result = await tool.execute(
+            "rm -rf /home/miqi/workspace/x",
+            working_dir=str(tmp_path),
+            _sandbox=_make_selection(st),
+        )
+        assert "沙箱护栏拦截" in result, f"{st} must keep host semantics"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -875,10 +999,10 @@ async def test_restricted_network_block_all_fails_closed(tmp_path):
     """RESTRICTED with BLOCK_ALL network policy must fail closed —
     direct host execution cannot enforce network isolation."""
     tool = ExecTool(timeout=5, working_dir=str(tmp_path))
-    from miqi.protocol.permissions import NetworkSandboxPolicy as NSP
+    from miqi.protocol.permissions import NetworkSandboxPolicy
 
     sel = _make_selection(SandboxType.RESTRICTED)
-    sel.network_policy = NSP.BLOCK_ALL  # type: ignore[assignment]
+    sel.network_policy = NetworkSandboxPolicy.BLOCK_ALL  # type: ignore[assignment]
 
     result = await tool.execute(
         "python -c \"print('should-not-run')\"",
@@ -886,18 +1010,18 @@ async def test_restricted_network_block_all_fails_closed(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
+    assert "未执行" in result
     assert "network" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_restricted_network_allow_all_proceeds(tmp_path):
     """RESTRICTED with ALLOW_ALL network policy must proceed."""
-    from miqi.protocol.permissions import NetworkSandboxPolicy as NSP
+    from miqi.protocol.permissions import NetworkSandboxPolicy
 
     tool = ExecTool(timeout=5, working_dir=str(tmp_path))
     sel = _make_selection(SandboxType.RESTRICTED)
-    sel.network_policy = NSP.ALLOW_ALL  # type: ignore[assignment]
+    sel.network_policy = NetworkSandboxPolicy.ALLOW_ALL  # type: ignore[assignment]
 
     result = await tool.execute(
         "python -c \"print('network-allowed')\"",
@@ -914,9 +1038,9 @@ async def test_restricted_network_allow_all_proceeds(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_engine_restricted_exec_defaults_to_block_all():
-    """SandboxPolicyEngine defaults RESTRICTED exec network_policy to
-    BLOCK_ALL when permission_profile has network_allowed=False."""
+async def test_engine_exec_no_sandbox_selects_none_with_network_allowed():
+    """SandboxPolicyEngine selects NONE for exec when no stronger sandbox
+    is available — direct host execution, network allowed, no restrictions."""
     from miqi.execution.sandbox_policy import SandboxPolicyEngine
     from miqi.runtime.permission_profile import PermissionProfile
 
@@ -933,20 +1057,97 @@ async def test_engine_restricted_exec_defaults_to_block_all():
         permission_profile = profile
 
     sel = await engine.select(FakeCtx())
-    # Engine selected RESTRICTED (no bwrap, no landlock)
+    # No bwrap, no landlock — NONE: direct host execution
+    assert sel.sandbox_type == SandboxType.NONE
+    # Network stays ALLOW_ALL so exec can run
+    assert sel.network_policy == "allow_all"
+
+
+@pytest.mark.asyncio
+async def test_engine_restricted_exec_with_sandbox_available_blocks_network():
+    """When bwrap is available but the selection was downgraded to
+    RESTRICTED (escalation past BWRAP/LANDLOCK), network stays BLOCK_ALL
+    unless permission_profile.network_allowed=True."""
+    from miqi.execution.sandbox_policy import SandboxPolicyEngine
+    from miqi.runtime.permission_profile import PermissionProfile
+
+    engine = SandboxPolicyEngine(bwrap_available=True, landlock_available=False)
+
+    profile = PermissionProfile(
+        workspace=None,  # type: ignore
+        network_allowed=False,
+    )
+
+    class FakeCtx:
+        tool_name = "exec"
+        arguments = {"command": "curl example.com"}
+        permission_profile = profile
+
+    # attempt=2 escalates past BWRAP and LANDLOCK down to RESTRICTED
+    sel = await engine.select(FakeCtx(), attempt=2)
     assert sel.sandbox_type == SandboxType.RESTRICTED
-    # Network should be BLOCK_ALL by default
+    assert sel.network_policy == "block_all"
+
+
+@pytest.mark.asyncio
+async def test_engine_restricted_exec_network_none_profile_blocks_without_sandbox():
+    """A PermissionProfile with network="none" is an explicit denial —
+    RESTRICTED exec gets BLOCK_ALL even when no stronger sandbox is
+    available, so the no-sandbox fallback cannot bypass the denial."""
+    from miqi.execution.sandbox_policy import SandboxPolicyEngine
+    from miqi.runtime.permission_profile import PermissionProfile
+
+    engine = SandboxPolicyEngine(bwrap_available=False, landlock_available=False)
+
+    profile = PermissionProfile(
+        workspace=None,  # type: ignore
+        network="none",
+        network_allowed=False,
+    )
+
+    class FakeCtx:
+        tool_name = "exec"
+        arguments = {"command": "curl example.com"}
+        permission_profile = profile
+
+    sel = await engine.select(FakeCtx())
+    assert sel.sandbox_type == SandboxType.RESTRICTED
+    assert sel.network_policy == "block_all"
+
+
+@pytest.mark.asyncio
+async def test_engine_restricted_exec_network_none_denial_wins_over_allow():
+    """network="none" is a hard denial: it blocks even when
+    network_allowed=True (deny wins over allow)."""
+    from miqi.execution.sandbox_policy import SandboxPolicyEngine
+    from miqi.runtime.permission_profile import PermissionProfile
+
+    engine = SandboxPolicyEngine(bwrap_available=False, landlock_available=False)
+
+    profile = PermissionProfile(
+        workspace=None,  # type: ignore
+        network="none",
+        network_allowed=True,
+    )
+
+    class FakeCtx:
+        tool_name = "exec"
+        arguments = {"command": "curl example.com"}
+        permission_profile = profile
+
+    sel = await engine.select(FakeCtx())
+    assert sel.sandbox_type == SandboxType.RESTRICTED
     assert sel.network_policy == "block_all"
 
 
 @pytest.mark.asyncio
 async def test_engine_restricted_exec_network_allowed_overrides_to_allow_all():
     """When permission_profile.network_allowed=True, RESTRICTED exec
-    keeps ALLOW_ALL network policy."""
+    (downgraded from an available bwrap) keeps ALLOW_ALL network policy."""
     from miqi.execution.sandbox_policy import SandboxPolicyEngine
     from miqi.runtime.permission_profile import PermissionProfile
 
-    engine = SandboxPolicyEngine(bwrap_available=False, landlock_available=False)
+    engine = SandboxPolicyEngine(bwrap_available=True, landlock_available=False)
 
     profile = PermissionProfile(
         workspace=None,  # type: ignore
@@ -958,7 +1159,8 @@ async def test_engine_restricted_exec_network_allowed_overrides_to_allow_all():
         arguments = {"command": "curl example.com"}
         permission_profile = profile
 
-    sel = await engine.select(FakeCtx())
+    # attempt=2 escalates past BWRAP and LANDLOCK down to RESTRICTED
+    sel = await engine.select(FakeCtx(), attempt=2)
     assert sel.sandbox_type == SandboxType.RESTRICTED
     assert sel.network_policy == "allow_all"
 
@@ -989,7 +1191,7 @@ async def test_restricted_fail_produces_no_output_delta_events(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
+    assert "未执行" in result
     deltas = [
         e for e in emitter.events
         if isinstance(e, ExecCommandOutputDeltaEvent)
@@ -1078,7 +1280,7 @@ async def test_landlock_unsupported_fail_closed_unchanged():
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
+    assert "未执行" in result
     assert "LANDLOCK" in result
 
 
@@ -1099,8 +1301,8 @@ async def test_restricted_rejects_shell_var_with_path(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -1115,8 +1317,8 @@ async def test_restricted_rejects_braced_shell_var_with_path(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -1131,8 +1333,8 @@ async def test_restricted_rejects_tilde_expansion(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -1147,8 +1349,8 @@ async def test_restricted_rejects_tilde_user_expansion(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
@@ -1163,8 +1365,8 @@ async def test_restricted_rejects_shell_var_with_traversal(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1185,9 +1387,9 @@ async def test_landlock_explicit_selection_still_fail_closed():
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
+    assert "未执行" in result
     assert "LANDLOCK" in result
-    assert "not yet implemented" in result
+    assert "尚未实现" in result
 
 
 @pytest.mark.asyncio
@@ -1195,8 +1397,8 @@ async def test_exec_escalation_exhausted_raises_not_none():
     """Phase 33.4: When the SandboxPolicyEngine exhausts all sandbox types
     for exec, it raises SandboxDeniedError — NEVER returns NONE."""
     from miqi.execution.sandbox_policy import (
-        SandboxPolicyEngine,
         SandboxDeniedError,
+        SandboxPolicyEngine,
     )
 
     engine = SandboxPolicyEngine(
@@ -1216,11 +1418,13 @@ async def test_exec_escalation_exhausted_raises_not_none():
 
 @pytest.mark.asyncio
 async def test_allow_fallback_to_none_true_does_not_let_exec_become_none():
-    """Phase 33.4: allow_fallback_to_none=True must NOT make exec
-    fallback to NONE. Exec is always fail-closed on exhaustion."""
+    """allow_fallback_to_none=True must NOT weaken exec retry semantics.
+    Attempt 0 with no sandbox is the NONE base selection (direct host
+    execution), but exhaustion beyond it still raises — exec never
+    *falls back* to NONE."""
     from miqi.execution.sandbox_policy import (
-        SandboxPolicyEngine,
         SandboxDeniedError,
+        SandboxPolicyEngine,
     )
 
     engine = SandboxPolicyEngine(
@@ -1233,9 +1437,9 @@ async def test_allow_fallback_to_none_true_does_not_let_exec_become_none():
         tool_name = "exec"
         arguments = {"command": "npm test"}
 
-    # base=RESTRICTED, chain=[RESTRICTED]. attempt=0→RESTRICTED, attempt=1→exhausted
+    # base=NONE, chain=[NONE]. attempt=0→NONE, attempt=1→exhausted
     s0 = await engine.select(FakeCtx(), attempt=0)
-    assert s0.sandbox_type == SandboxType.RESTRICTED
+    assert s0.sandbox_type == SandboxType.NONE
 
     with pytest.raises(SandboxDeniedError) as exc_info:
         await engine.select(FakeCtx(), attempt=1)
@@ -1271,15 +1475,15 @@ async def test_sandbox_policy_reason_includes_landlock_unsupported():
         arguments = {"command": "npm test"}
 
     sel = await engine.select(FakeCtx())
-    assert sel.sandbox_type == SandboxType.RESTRICTED
+    assert sel.sandbox_type == SandboxType.NONE
     assert "landlock_supported=False" in sel.reason
     assert "no Landlock adapter" in sel.reason
 
 
 @pytest.mark.asyncio
 async def test_sandbox_policy_reason_includes_fallback_info():
-    """Phase 33.4: reason for RESTRICTED exec explains why no stronger
-    sandbox is available."""
+    """Phase 33.4: reason for NONE exec explains why no sandbox is
+    available and that execution is unrestricted."""
     from miqi.execution.sandbox_policy import SandboxPolicyEngine
 
     engine = SandboxPolicyEngine(bwrap_available=False, landlock_available=False)
@@ -1290,7 +1494,7 @@ async def test_sandbox_policy_reason_includes_fallback_info():
 
     sel = await engine.select(FakeCtx())
     assert "bwrap unavailable" in sel.reason
-    assert "no stronger sandbox" in sel.reason
+    assert "direct host execution without restrictions" in sel.reason
 
 
 @pytest.mark.asyncio
@@ -1317,8 +1521,8 @@ async def test_sandbox_policy_reason_for_bwrap_selection():
 async def test_sandbox_denied_error_for_exec_is_clear():
     """Phase 33.4: SandboxDeniedError for exec gives actionable message."""
     from miqi.execution.sandbox_policy import (
-        SandboxPolicyEngine,
         SandboxDeniedError,
+        SandboxPolicyEngine,
     )
 
     engine = SandboxPolicyEngine(
@@ -1374,18 +1578,18 @@ async def test_regression_restricted_rejects_outside_workspace_unchanged(tmp_pat
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
-    assert "outside workspace" in result.lower()
+    assert "未执行" in result
+    assert "超出" in result or "工作区" in result
 
 
 @pytest.mark.asyncio
 async def test_regression_restricted_network_block_all_unchanged(tmp_path):
     """Phase 33.4 regression: RESTRICTED with BLOCK_ALL still fails closed."""
-    from miqi.protocol.permissions import NetworkSandboxPolicy as NSP
+    from miqi.protocol.permissions import NetworkSandboxPolicy
 
     tool = ExecTool(timeout=5, working_dir=str(tmp_path))
     sel = _make_selection(SandboxType.RESTRICTED)
-    sel.network_policy = NSP.BLOCK_ALL  # type: ignore[assignment]
+    sel.network_policy = NetworkSandboxPolicy.BLOCK_ALL  # type: ignore[assignment]
 
     result = await tool.execute(
         "python -c \"print('should-not-run')\"",
@@ -1393,5 +1597,5 @@ async def test_regression_restricted_network_block_all_unchanged(tmp_path):
         _sandbox=sel,
     )
 
-    assert "NOT executed" in result
+    assert "未执行" in result
     assert "network" in result.lower()

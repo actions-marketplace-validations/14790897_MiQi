@@ -25,7 +25,6 @@ from typing import Any
 import aiosqlite
 from loguru import logger
 
-
 VALID_HISTORY_ROLES = frozenset({
     "system",
     "user",
@@ -129,6 +128,56 @@ class HistoryRuntime:
                 created_at REAL NOT NULL
             )
         """)
+        # #740: execution snapshots — in-flight turn state persisted so an
+        # interrupted turn (process exit / abort) can be resumed later.
+        # Deleted when the turn completes normally (content is then persisted
+        # as real messages); kept when interrupted (status=running/interrupted).
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS execution_snapshots (
+                turn_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                assistant_content TEXT NOT NULL DEFAULT '',
+                reasoning_content TEXT NOT NULL DEFAULT '',
+                tool_state_json TEXT NOT NULL DEFAULT '[]',
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at REAL NOT NULL,
+                reasoning_elapsed_s REAL,
+                reasoning_mode TEXT
+            )
+        """)
+        # #834: reasoning_elapsed_s was added after the original table schema,
+        # so older DBs need a migration (SQLite has no ADD COLUMN IF NOT
+        # EXISTS before 3.35).  Fresh DBs already have the column via the
+        # CREATE above; the ALTER only fires for pre-existing tables.
+        # Check-then-act is racy across concurrent connections, so the ALTER
+        # itself is guarded (CR #856-4).  #905 review extends the same pattern
+        # for reasoning_mode (fast/think label on restored interrupted cards).
+        async with self._db.execute("PRAGMA table_info(execution_snapshots)") as cursor:
+            cols = {row[1] for row in await cursor.fetchall()}
+        if "reasoning_elapsed_s" not in cols:
+            try:
+                await self._db.execute(
+                    "ALTER TABLE execution_snapshots ADD COLUMN reasoning_elapsed_s REAL"
+                )
+            except Exception:
+                # Concurrent initializer may have won the race — verify the
+                # column now exists before treating anything as an error.
+                async with self._db.execute("PRAGMA table_info(execution_snapshots)") as cursor:
+                    cols2 = {row[1] for row in await cursor.fetchall()}
+                if "reasoning_elapsed_s" not in cols2:
+                    raise
+        if "reasoning_mode" not in cols:
+            try:
+                await self._db.execute(
+                    "ALTER TABLE execution_snapshots ADD COLUMN reasoning_mode TEXT"
+                )
+            except Exception:
+                async with self._db.execute("PRAGMA table_info(execution_snapshots)") as cursor:
+                    cols2 = {row[1] for row in await cursor.fetchall()}
+                if "reasoning_mode" not in cols2:
+                    raise
         await self._db.commit()
 
     async def close(self) -> None:
@@ -207,7 +256,7 @@ class HistoryRuntime:
             tools_used = json.loads(row["tools_used_json"])
         except (json.JSONDecodeError, TypeError) as exc:
             logger.warning(
-                "Corrupted tools_used_json for turn %s, degrading to []: %s",
+                "Corrupted tools_used_json for turn {}, degrading to []: {}",
                 turn_id, exc,
             )
             tools_used = []
@@ -217,7 +266,7 @@ class HistoryRuntime:
             token_usage = json.loads(row["token_usage_json"])
         except (json.JSONDecodeError, TypeError) as exc:
             logger.warning(
-                "Corrupted token_usage_json for turn %s, degrading to {}: %s",
+                "Corrupted token_usage_json for turn {}, degrading to {{}}: {}",
                 turn_id, exc,
             )
             token_usage = {}
@@ -294,7 +343,7 @@ class HistoryRuntime:
                 payload = json.loads(row["payload_json"])
             except (json.JSONDecodeError, TypeError) as exc:
                 logger.warning(
-                    "Skipping corrupted payload_json for item %s in thread %s: %s",
+                    "Skipping corrupted payload_json for item {} in thread {}: {}",
                     row["item_id"], thread_id, exc,
                 )
                 payload = {}
@@ -358,6 +407,117 @@ class HistoryRuntime:
             ))
             copied += 1
         return copied
+
+    # ── #740: execution snapshots (in-flight turn state) ───────────────
+
+    async def upsert_snapshot(
+        self,
+        turn_id: str,
+        thread_id: str,
+        *,
+        status: str = "running",
+        assistant_content: str = "",
+        reasoning_content: str = "",
+        tool_state: list[dict] | None = None,
+        version: int = 1,
+        reasoning_elapsed_s: float | None = None,
+        reasoning_mode: str | None = None,
+    ) -> None:
+        """Persist (or update) an in-flight turn's execution snapshot.
+
+        Called by the turn loop on a throttle (time/bytes threshold), on
+        interruption, and on completion (before the snapshot is deleted).
+        """
+        db = self._conn
+        await db.execute(
+            """INSERT INTO execution_snapshots
+               (turn_id, thread_id, session_id, status, assistant_content,
+                reasoning_content, tool_state_json, version, updated_at,
+                reasoning_elapsed_s, reasoning_mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(turn_id) DO UPDATE SET
+                status = excluded.status,
+                assistant_content = excluded.assistant_content,
+                reasoning_content = excluded.reasoning_content,
+                tool_state_json = excluded.tool_state_json,
+                version = excluded.version,
+                updated_at = excluded.updated_at,
+                reasoning_elapsed_s = excluded.reasoning_elapsed_s,
+                reasoning_mode = excluded.reasoning_mode""",
+            (
+                turn_id, thread_id, self.session_id, status,
+                assistant_content, reasoning_content,
+                json.dumps(tool_state or [], ensure_ascii=False),
+                version, time.time(), reasoning_elapsed_s, reasoning_mode,
+            ),
+        )
+        await db.commit()
+
+    async def get_snapshot(self, turn_id: str) -> dict[str, Any] | None:
+        """Return the snapshot for a turn (scoped to this session), or None."""
+        db = self._conn
+        async with db.execute(
+            "SELECT * FROM execution_snapshots WHERE turn_id = ? AND session_id = ?",
+            (turn_id, self.session_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._snapshot_row_to_dict(row)
+
+    async def get_interrupted_snapshots(self) -> list[dict[str, Any]]:
+        """Return recoverable snapshots for this runtime's session.
+
+        Queried by session_id (not thread_id) — threads use UUID-style ids
+        ("thread-…") while the load path historically derived "sid:default";
+        session_id matches on both sides (#740).
+        Used by the session-load path to render "任务被中断" cards with the
+        half-generated content the user saw before the interruption.
+        """
+        db = self._conn
+        async with db.execute(
+            """SELECT * FROM execution_snapshots
+               WHERE session_id = ? AND status IN ('running', 'interrupted')
+               ORDER BY updated_at DESC""",
+            (self.session_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._snapshot_row_to_dict(r) for r in rows]
+
+    async def delete_snapshot(self, turn_id: str) -> None:
+        """Remove a turn's snapshot (scoped to this session)."""
+        db = self._conn
+        await db.execute(
+            "DELETE FROM execution_snapshots WHERE turn_id = ? AND session_id = ?",
+            (turn_id, self.session_id),
+        )
+        await db.commit()
+
+    async def clear_snapshots(self, thread_id: str) -> int:
+        """Remove all snapshots for a thread (session deleted/archived)."""
+        db = self._conn
+        async with db.execute(
+            "DELETE FROM execution_snapshots WHERE thread_id = ?",
+            (thread_id,),
+        ) as cursor:
+            await db.commit()
+            return int(cursor.rowcount or 0)
+
+    @staticmethod
+    def _snapshot_row_to_dict(row: Any) -> dict[str, Any]:
+        """Convert a snapshot row to the dict shape consumed by the load path."""
+        return {
+            "turn_id": row["turn_id"],
+            "thread_id": row["thread_id"],
+            "status": row["status"],
+            "assistant_content": row["assistant_content"],
+            "reasoning_content": row["reasoning_content"],
+            "reasoning_elapsed_s": row["reasoning_elapsed_s"],
+            "reasoning_mode": row["reasoning_mode"],
+            "tool_state": json.loads(row["tool_state_json"] or "[]"),
+            "version": row["version"],
+            "updated_at": row["updated_at"],
+        }
 
     # ── Phase 19: compaction persistence ───────────────────────────────
 

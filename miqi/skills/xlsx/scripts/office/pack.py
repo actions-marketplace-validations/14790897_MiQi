@@ -11,15 +11,15 @@ Examples:
 """
 
 import argparse
-import sys
 import shutil
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
 import defusedxml.minidom
-
 from validators import DOCXSchemaValidator, PPTXSchemaValidator, RedliningValidator
+
 
 def pack(
     input_directory: str,
@@ -33,10 +33,10 @@ def pack(
     suffix = output_path.suffix.lower()
 
     if not input_dir.is_dir():
-        return None, f"Error: {input_dir} is not a directory"
+        return None, f"Error: {input_dir} 不是目录"
 
     if suffix not in {".docx", ".pptx", ".xlsx"}:
-        return None, f"Error: {output_file} must be a .docx, .pptx, or .xlsx file"
+        return None, f"Error: {output_file} 必须是 .docx、.pptx 或 .xlsx 文件"
 
     if validate and original_file:
         original_path = Path(original_file)
@@ -47,7 +47,7 @@ def pack(
             if output:
                 print(output)
             if not success:
-                return None, f"Error: Validation failed for {input_dir}"
+                return None, f"Error: 校验失败：{input_dir}"
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_content_dir = Path(temp_dir) / "content"

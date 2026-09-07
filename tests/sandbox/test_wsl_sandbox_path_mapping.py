@@ -67,7 +67,7 @@ class TestCanonicalizeWslMntPath:
         ws = tmp_path / "sub"
         ws.mkdir()
         mnt = _as_mnt_path(ws, "..", "secret.txt")
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _canonicalize_wsl_mnt_path(mnt, ws)
 
     @pytest.mark.skipif(not _IS_WINDOWS, reason="WSL containment Windows-only")
@@ -76,7 +76,7 @@ class TestCanonicalizeWslMntPath:
         ws.mkdir()
         other = tmp_path / "other"
         other.mkdir()
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _canonicalize_wsl_mnt_path(_as_mnt_path(other, "file.txt"), ws)
 
     def test_no_workspace_returns_unchanged(self):
@@ -147,7 +147,7 @@ class TestCanonicalizeWslMntPath:
         host_skills.mkdir()
         other_session = tmp_path / "sessions" / "other" / "files"
         other_session.mkdir(parents=True)
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _canonicalize_wsl_mnt_path(
                 _as_mnt_path(other_session, "secret.md"),
                 session_ws,
@@ -164,7 +164,7 @@ class TestCanonicalizeWslMntPath:
         host_memory.mkdir()
         # From inside memory, traverse up via .. into an unrelated dir.
         mnt = _as_mnt_path(host_memory, "..", "evil.txt")
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _canonicalize_wsl_mnt_path(mnt, session_ws, extra_roots=[host_memory])
 
     @pytest.mark.skipif(not _IS_WINDOWS, reason="WSL containment Windows-only")
@@ -203,7 +203,7 @@ class TestResolveSandboxPathWSL:
         sb = _make_wsl_sandbox()
         other = tmp_path / "other"
         other.mkdir()
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _resolve_sandbox_path(str(other.resolve() / "file.txt"), ws, sb)
 
     def test_relative_path_under_wsl(self, tmp_path):
@@ -219,7 +219,7 @@ class TestResolveSandboxPathWSL:
         ws = tmp_path / "sub"
         ws.mkdir()
         sb = _make_wsl_sandbox()
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _resolve_sandbox_path("../../secret.txt", ws, sb)
 
     def test_linux_path_kept_as_is(self, tmp_path):
@@ -246,7 +246,7 @@ class TestResolveSandboxPathWSL:
         other = tmp_path / "other"
         other.mkdir()
         sb = _make_wsl_sandbox()
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _resolve_sandbox_path(_as_mnt_path(other, "file.txt"), ws, sb)
 
     def test_native_sandbox_uses_workspace_remap(self, tmp_path):
@@ -288,13 +288,68 @@ class TestResolveSandboxPathWSL:
         assert "MEMORY.md" in ok
 
         # foreign session path still rejected
-        with pytest.raises(PermissionError, match="outside"):
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
             _resolve_sandbox_path(
                 str(other_session / "secret.md"),
                 session_ws,
                 sb,
                 extra_roots=[host_memory],
             )
+
+    @pytest.mark.skipif(not _IS_WINDOWS, reason="WSL containment Windows-only")
+    def test_root_workspace_read_allowed_with_session_isolation(self, tmp_path):
+        """issue #613 follow-up: read tools resolve against the ROOT workspace
+        (the working dir the system prompt advertises); session isolation is
+        enforced via session_files_dir.  Root-workspace files must be readable
+        even when per-session isolation is active."""
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        session_ws = ws / "sessions" / "abc" / "files"
+        session_ws.mkdir(parents=True)
+        other_session = ws / "sessions" / "other" / "files"
+        other_session.mkdir(parents=True)
+        sb = _make_wsl_sandbox()
+
+        # Root workspace file: accepted (was rejected before the fix).
+        ok = _resolve_sandbox_path(
+            str(ws / "report.md"),
+            ws,
+            sb,
+            session_files_dir=session_ws,
+        )
+        assert "/report.md" in ok
+
+        # Own session dir: accepted.
+        ok_own = _resolve_sandbox_path(
+            str(session_ws / "x.txt"),
+            ws,
+            sb,
+            session_files_dir=session_ws,
+        )
+        assert "x.txt" in ok_own
+
+        # Other session dir: still rejected — isolation red line.
+        with pytest.raises(PermissionError, match="隔离"):
+            _resolve_sandbox_path(
+                str(other_session / "secret.md"),
+                ws,
+                sb,
+                session_files_dir=session_ws,
+            )
+
+    @pytest.mark.skipif(not _IS_WINDOWS, reason="WSL containment Windows-only")
+    def test_session_isolation_check_noop_without_session_files_dir(self, tmp_path):
+        """When session_files_dir is None (no session isolation), the
+        sessions/ dir is treated like any other workspace subdir."""
+        ws = tmp_path / "workspace"
+        ws.mkdir()
+        sb = _make_wsl_sandbox()
+        ok = _resolve_sandbox_path(
+            str(ws / "sessions" / "x" / "files" / "f.txt"),
+            ws,
+            sb,
+        )
+        assert "f.txt" in ok
 
 
 # ── _sandbox_to_host_path ────────────────────────────────────────────────
@@ -326,3 +381,79 @@ class TestSandboxToHostPath:
         sb = _make_wsl_sandbox()
         assert _sandbox_to_host_path("", tmp_path, sb) == ""
         assert _sandbox_to_host_path(None, tmp_path, sb) is None
+
+
+# ── Issue #821: _user_roots injection into WriteFileTool ────────────────
+
+class TestWriteFileUserRootsWSL:
+    """Per-call user-mentioned roots authorize the user's output dirs under
+    the WSL sandbox (issue #821), and are ignored when disabled."""
+
+    def _make_manager(self, ws: Path):
+        from unittest.mock import AsyncMock
+
+        sb = _make_wsl_sandbox()
+        sb.is_running = True
+        sb.workspace = ws
+        sb.run_command = AsyncMock(return_value=(0, "", ""))
+        manager = MagicMock()
+        manager.active_sandbox = sb
+        manager.get_or_create = AsyncMock(return_value=sb)
+        return manager
+
+    @pytest.mark.skipif(not _IS_WINDOWS, reason="WSL containment Windows-only")
+    @pytest.mark.asyncio
+    async def test_user_roots_allow_write_outside_workspace(self, tmp_path):
+        from miqi.agent.tools.filesystem import WriteFileTool
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        out = tmp_path / "Desktop_out"
+        out.mkdir()
+        manager = self._make_manager(ws)
+        tool = WriteFileTool(
+            workspace=ws, sandbox_manager=manager, shared_roots=[ws],
+        )
+        target = out / "report.md"
+        result = await tool.execute(
+            str(target), "hello", _session_key="s1", _user_roots=[str(out)],
+        )
+        assert result.startswith("Successfully wrote")
+
+    @pytest.mark.skipif(not _IS_WINDOWS, reason="WSL containment Windows-only")
+    @pytest.mark.asyncio
+    async def test_without_user_roots_write_rejected(self, tmp_path):
+        from miqi.agent.tools.filesystem import WriteFileTool
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        out = tmp_path / "Desktop_out"
+        out.mkdir()
+        manager = self._make_manager(ws)
+        tool = WriteFileTool(
+            workspace=ws, sandbox_manager=manager, shared_roots=[ws],
+        )
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
+            await tool.execute(
+                str(out / "report.md"), "hello", _session_key="s1",
+            )
+
+    @pytest.mark.skipif(not _IS_WINDOWS, reason="WSL containment Windows-only")
+    @pytest.mark.asyncio
+    async def test_disabled_flag_ignores_user_roots(self, tmp_path):
+        from miqi.agent.tools.filesystem import WriteFileTool
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        out = tmp_path / "Desktop_out"
+        out.mkdir()
+        manager = self._make_manager(ws)
+        tool = WriteFileTool(
+            workspace=ws, sandbox_manager=manager, shared_roots=[ws],
+            allow_user_roots=False,
+        )
+        with pytest.raises(PermissionError, match="超出|不在|根目录"):
+            await tool.execute(
+                str(out / "report.md"), "hello", _session_key="s1",
+                _user_roots=[str(out)],
+            )

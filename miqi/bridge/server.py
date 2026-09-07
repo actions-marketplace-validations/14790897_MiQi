@@ -20,18 +20,21 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
-import os
-import re
 import signal
 import sys
 import threading
 import time
-import traceback
-import uuid
 from pathlib import Path
 from typing import Any
 
-from miqi.runtime.workspace_logging import append_workspace_log, _redact_message
+from miqi.bridge.loopback_compat import install_loopback_safe_socketpair
+from miqi.runtime.workspace_logging import _redact_message, append_workspace_log
+
+# Windows loopback can be selectively filtered by security software (WFP
+# residue), which makes asyncio's socketpair-based self-pipe hang forever and
+# the bridge never reaches "ready". Install the guarded fallback before any
+# asyncio event loop is created.
+install_loopback_safe_socketpair()
 
 # Force UTF-8 on Windows (default is GBK/cp936 which cannot encode emoji)
 if hasattr(sys.stdout, 'reconfigure'):
@@ -46,6 +49,9 @@ _stdout_buffer = sys.stdout.buffer if hasattr(sys.stdout, 'buffer') else None
 
 _stdout_lock = threading.Lock()
 _file_logging_sinks: dict[Path, int] = {}
+
+# Client prefix used to namespace session keys in sandbox metadata lookups.
+_CLIENT_PREFIX = "miqi-desktop:"
 
 
 def _log(msg: str, level: str = "INFO") -> None:
@@ -129,6 +135,10 @@ class BridgeState:
 
     def __init__(self) -> None:
         self.config = None  # lazy-loaded
+        # #789: snapshot of the config at process start — never overwritten by
+        # saves.  Used to compute PENDING restart-requiring state (tier-C
+        # fields whose current value differs from what the process runs with).
+        self.config_at_startup = None
         self._lock = threading.Lock()
         self._terminated: set[str] = set()
         self._pending_approvals: dict[str, threading.Event] = {}
@@ -146,6 +156,12 @@ class BridgeState:
         from miqi.config.loader import load_config
 
         self.config = load_config()
+        # First load in the process is the startup snapshot (#789).  Deep
+        # copy: handlers mutate self.config in place (e.g. mcp_upsert /
+        # mcp_delete), and a shared nested object would corrupt the
+        # pending-restart baseline (2026-09-01 review).
+        if self.config_at_startup is None:
+            self.config_at_startup = self.config.model_copy(deep=True)
         return self.config
 
     async def get_runtime_session(self, session_key: str, *, caller_id: str = "", approval_callback=None):
@@ -213,7 +229,6 @@ class BridgeState:
                 # may be called without client_id, so strip the known client
                 # prefix `miqi-desktop:` when present, and otherwise keep the
                 # key intact (a raw key like `desktop:xxx` must not be split).
-                _CLIENT_PREFIX = "miqi-desktop:"
                 bare_key = key
                 if key.startswith(_CLIENT_PREFIX):
                     bare_key = key[len(_CLIENT_PREFIX):]
@@ -224,7 +239,7 @@ class BridgeState:
 
         self._sandbox_manager = SandboxManager(
             workspace=config.workspace_path,
-            share_net=getattr(sb_cfg, "share_net", False),
+            share_net=getattr(sb_cfg, "share_net", True),
             # Start with enabled=False so tools run locally during
             # background install.  _init_sandbox_manager() in loop.py
             # auto-enables after initialize() succeeds and persists
@@ -233,6 +248,7 @@ class BridgeState:
             max_sandboxes=getattr(sb_cfg, "max_sandboxes", 10),
             auto_cleanup=getattr(sb_cfg, "auto_cleanup", True),
             auto_install_deps=getattr(sb_cfg, "auto_install_deps", True),
+            allow_system_installs=getattr(sb_cfg, "allow_system_installs", False),
             wsl_distro=getattr(sb_cfg, "wsl_distro", ""),
             wsl_base_dir=getattr(sb_cfg, "wsl_base_dir", "/tmp/miqi-sandboxes"),
             session_workspace_resolver=_session_workspace,
@@ -358,13 +374,6 @@ class BridgeState:
 
 _state = BridgeState()
 
-from miqi.agent.tools.filesystem import (
-    _delete_snapshot,
-    _snapshots_lock,
-    _maybe_snapshot,
-    _restore_snapshot,
-    _read_snapshot,
-)
 
 # ---------------------------------------------------------------------------
 # Handlers
@@ -588,6 +597,37 @@ def _graceful_shutdown() -> None:
 
 def main() -> None:
     global _bridge_state
+
+    # Fast self-check mode: report Python/deps availability and exit without
+    # starting the bridge. Electron's python.check used to spawnSync this
+    # binary with --check; without this early exit the bridge started fully
+    # and then sat waiting on stdin until the sync call timed out (#603).
+    if "--check" in sys.argv:
+        # JSON-only path: do NOT call _init_logging() — it imports loguru,
+        # which would mask a missing-loguru dependency from the report.
+        try:
+            import importlib
+
+            issues = []
+            if sys.version_info < (3, 11):
+                issues.append(
+                    f"Python {sys.version_info.major}.{sys.version_info.minor} is too old (need >= 3.11)",
+                )
+            for mod in ("pydantic", "httpx", "loguru"):
+                try:
+                    importlib.import_module(mod)
+                except ImportError:
+                    issues.append(f"Missing dependency: {mod}")
+            info = {
+                "ok": len(issues) == 0,
+                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                "issues": issues,
+            }
+            print(json.dumps(info), flush=True)
+        except Exception as exc:
+            print(json.dumps({"ok": False, "issues": [f"check failed: {exc}"]}), flush=True)
+        return
+
     _init_logging()
     _log("Bridge server starting")
     _ensure_workspace_init()

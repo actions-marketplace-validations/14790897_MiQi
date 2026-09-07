@@ -1,5 +1,6 @@
 """Tests for TurnRunner (Phase 12.3)."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -98,8 +99,85 @@ def turn_runner(fake_tool_runtime, fake_context_runtime):
 # ── Tests ──────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_turn_runner_returns_final_response(turn_runner, fake_turn_context):
+async def test_empty_response_gets_nudged_and_continues(
+    turn_runner, fake_turn_context,
+):
+    """A round that yields only reasoning (empty content, no tool calls)
+    must not end the turn with a blank reply — the model is nudged to
+    continue and the next round's answer becomes the final response."""
+    from miqi.providers.base import LLMStreamEvent
+
     runner, provider = turn_runner
+    calls = []
+
+    class _EmptyOnlyReasoning(_FakeResponse):
+        def __init__(self):
+            super().__init__(content=None)
+            self.reasoning_content = "long thinking only"
+
+    async def _stream(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            yield LLMStreamEvent(kind="completed", response=_EmptyOnlyReasoning())
+        else:
+            yield LLMStreamEvent(kind="completed", response=_FakeResponse(content="final answer"))
+
+    provider.stream_chat = _stream
+
+    result = await runner.run(
+        turn=fake_turn_context,
+        user_content="hello",
+        system_prompt="system",
+        tools=[],
+    )
+
+    assert len(calls) == 2, "empty-response round must be followed by a nudge round"
+    assert result.final_content == "final answer"
+
+
+@pytest.mark.asyncio
+async def test_empty_response_nudges_are_bounded(
+    turn_runner, fake_turn_context,
+):
+    """Repeated empty-only-reasoning rounds must eventually fail loudly
+    (ProviderError) instead of looping forever."""
+    import pytest as _pytest
+
+    from miqi.providers.base import LLMStreamEvent
+    from miqi.providers.resilience import ProviderError
+
+    runner, provider = turn_runner
+
+    class _EmptyOnlyReasoning(_FakeResponse):
+        def __init__(self):
+            super().__init__(content=None)
+            self.reasoning_content = "long thinking only"
+
+    async def _stream(**kwargs):
+        yield LLMStreamEvent(kind="completed", response=_EmptyOnlyReasoning())
+
+    provider.stream_chat = _stream
+
+    with _pytest.raises(ProviderError):
+        await runner.run(
+            turn=fake_turn_context,
+            user_content="hello",
+            system_prompt="system",
+            tools=[],
+        )
+
+
+@pytest.mark.asyncio
+async def test_turn_runner_returns_final_response(turn_runner, fake_turn_context):
+    from unittest.mock import AsyncMock
+
+    runner, provider = turn_runner
+
+    # Phase 20: TurnRunner must use stream_chat() — a direct chat() call
+    # fails the test loudly instead of being silently tolerated.
+    provider.chat = AsyncMock(
+        side_effect=AssertionError("TurnRunner must use stream_chat, not chat()"),
+    )
 
     result = await runner.run(
         turn=fake_turn_context,
@@ -110,8 +188,36 @@ async def test_turn_runner_returns_final_response(turn_runner, fake_turn_context
 
     assert result.final_content == "final answer"
     assert result.messages[-1]["role"] == "assistant"
-    # Phase 20: no direct chat() call — stream_chat is used instead
-    assert not hasattr(provider, "chat_called") or True  # sanity
+    provider.chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_turn_runner_aborts_mid_stream(turn_runner, fake_turn_context):
+    """Abort must stop generation WHILE the stream is flowing, not only at the
+    next iteration boundary — a single-shot reply is one iteration, so the
+    iteration-start check alone would let the old turn stream to completion
+    after an interrupt (#542)."""
+    from miqi.providers.base import LLMStreamEvent
+
+    runner, provider = turn_runner
+    cancel_event = asyncio.Event()
+
+    async def _stream(**kwargs):
+        yield LLMStreamEvent(kind="content_delta", delta="chunk-0")
+        cancel_event.set()  # abort fires between stream events
+        yield LLMStreamEvent(kind="content_delta", delta="chunk-1")
+        yield LLMStreamEvent(kind="completed", response=_FakeResponse(content="done"))
+
+    provider.stream_chat = _stream
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run(
+            turn=fake_turn_context,
+            user_content="hello",
+            system_prompt="system",
+            tools=[],
+            cancel_event=cancel_event,
+        )
 
 
 @pytest.mark.asyncio
@@ -153,6 +259,39 @@ async def test_turn_runner_handles_tool_calls(turn_runner, fake_turn_context, fa
     assert "read_file" in result.tools_used
     assert call_count == 2  # stream_chat was called twice
     fake_tool_runtime.execute_many.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_turn_runner_passes_reasoning_content_through(turn_runner, fake_turn_context):
+    """reasoning_delta + response.reasoning_content reach the result (Issue #539)."""
+    from miqi.providers.base import LLMStreamEvent
+
+    runner, provider = turn_runner
+
+    async def _stream_with_reasoning(**kwargs):
+        yield LLMStreamEvent(kind="reasoning_delta", delta="step 1 ")
+        yield LLMStreamEvent(kind="reasoning_delta", delta="step 2")
+        resp = _FakeResponse(content="answer")
+        resp.reasoning_content = "step 1 step 2 (full)"
+        yield LLMStreamEvent(kind="completed", response=resp)
+
+    provider.stream_chat = _stream_with_reasoning
+
+    result = await runner.run(
+        turn=fake_turn_context,
+        user_content="hello",
+        system_prompt="system",
+        tools=[],
+    )
+
+    # Reasoning is surfaced on the result for the UI.
+    # The completed response's value takes priority over streamed deltas.
+    assert result.reasoning == "step 1 step 2 (full)"
+    # And persisted into the message delta for JSONL storage.
+    asst_deltas = [m for m in result.messages_delta if m.get("role") == "assistant"]
+    assert asst_deltas and asst_deltas[-1]["reasoning_content"] == "step 1 step 2 (full)"
+    # Visible content stays clean — reasoning is a separate field.
+    assert result.final_content == "answer"
 
 
 @pytest.mark.asyncio
@@ -451,8 +590,13 @@ async def test_turn_runner_emits_content_deltas():
         def build_initial_messages(self, **kwargs):
             return [{"role": "user", "content": kwargs["user_content"]}]
 
-        def add_assistant_message(self, *, messages, content, tool_calls=None):
-            return [*messages, {"role": "assistant", "content": content}]
+        def add_assistant_message(self, *, messages, content, tool_calls=None, reasoning_content=None):
+            item = {"role": "assistant", "content": content}
+            if tool_calls:
+                item["tool_calls"] = tool_calls
+            if reasoning_content:
+                item["reasoning_content"] = reasoning_content
+            return [*messages, item]
 
         def trim_for_model(self, messages, model):
             return messages
@@ -501,6 +645,7 @@ async def test_turn_runner_emits_content_deltas():
 @pytest.mark.asyncio
 async def test_turn_runner_consumes_steer_queue_before_completing_final_response():
     import asyncio as _asyncio
+
     from miqi.providers.base import LLMResponse, LLMStreamEvent
     from miqi.runtime.turn_runner import TurnRunner
 
@@ -525,8 +670,13 @@ async def test_turn_runner_consumes_steer_queue_before_completing_final_response
         def build_initial_messages(self, **kwargs):
             return [{"role": "user", "content": kwargs["user_content"]}]
 
-        def add_assistant_message(self, messages, content, tool_calls=None):
-            return [*messages, {"role": "assistant", "content": content}]
+        def add_assistant_message(self, messages, content, tool_calls=None, reasoning_content=None):
+            item = {"role": "assistant", "content": content}
+            if tool_calls:
+                item["tool_calls"] = tool_calls
+            if reasoning_content:
+                item["reasoning_content"] = reasoning_content
+            return [*messages, item]
 
         def add_tool_result(self, messages, tool_call_id, name, content):
             return [*messages, {"role": "tool", "content": content}]
@@ -716,3 +866,90 @@ async def test_turn_runner_leak_until_exhaustion_gets_friendly_notice(
     assert "已达到最大迭代次数" in result.final_content
     assert "工具调用" in result.final_content
     assert "检测到未被执行的工具调用" not in result.final_content
+
+
+@pytest.mark.asyncio
+async def test_running_flag_covers_lifecycle_hooks_and_resets_on_failure():
+    """#789: _running must be set before PROMPT_SUBMIT/TURN_START and released
+    even when a hook raises (2026-08-31 review) — otherwise a config save
+    during hook execution could swap the provider, and a hook failure would
+    leave the guard stuck True forever.
+    """
+    from unittest.mock import AsyncMock
+
+    class _BoomHooks:
+        def __init__(self):
+            self.run = AsyncMock(
+                side_effect=RuntimeError("hook PROMPT_SUBMIT failed")
+            )
+
+    hooks = _BoomHooks()
+    provider = MagicMock()
+    runner = TurnRunner(
+        provider=provider,
+        tool_runtime=MagicMock(),
+        context_runtime=MagicMock(),
+        event_emitter=MagicMock(),
+        max_iterations=3,
+        hooks=hooks,
+    )
+    assert runner._running is False
+    with pytest.raises(RuntimeError, match="hook PROMPT_SUBMIT"):
+        await runner.run(
+            turn=_FakeTurnContext(),
+            user_content="hi",
+            system_prompt="sys",
+            tools=[],
+        )
+    # The guard was raised before the hook ran (config saves during the
+    # hook were blocked) and released again on the failure.
+    assert runner._running is False
+
+
+@pytest.mark.asyncio
+async def test_running_flag_resets_when_turn_end_hook_raises():
+    """_running must clear even when the TURN_END hook raises (2026-09-01 review).
+
+    A stuck _running would make every later config save park its provider
+    swap forever — the runner would never adopt a new provider again.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from miqi.providers.base import LLMStreamEvent
+
+    hooks = MagicMock()
+
+    async def _hook_run(point, ctx):
+        if point.name == "TURN_END":
+            raise RuntimeError("TURN_END hook failed")
+
+    hooks.run = AsyncMock(side_effect=_hook_run)
+
+    provider = MagicMock()
+
+    async def _default_stream(**kwargs):
+        yield LLMStreamEvent(
+            kind="completed", response=_FakeResponse(content="final answer"),
+        )
+
+    provider.stream_chat = _default_stream
+    ev = MagicMock()
+    ev.emit = AsyncMock()
+    runner = TurnRunner(
+        provider=provider,
+        tool_runtime=MagicMock(),
+        context_runtime=MagicMock(),
+        event_emitter=ev,
+        max_iterations=3,
+        hooks=hooks,
+    )
+
+    with pytest.raises(RuntimeError, match="TURN_END hook failed"):
+        await runner.run(
+            turn=_FakeTurnContext(),
+            user_content="hi",
+            system_prompt="sys",
+            tools=[],
+        )
+    # The hook exception still propagates, but the guard is released.
+    assert runner._running is False

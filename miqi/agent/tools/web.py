@@ -1,22 +1,22 @@
 """Web tools: web_search and web_fetch."""
 
+import asyncio
 import html
 import ipaddress
-import asyncio
 import json
 import logging
 import os
 import re
 import socket
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
 
+from miqi.agent.tools.base import Tool
+
 # Suppress noisy readability tracebacks for empty/broken pages
 logging.getLogger("readability.readability").setLevel(logging.WARNING)
-
-from miqi.agent.tools.base import Tool
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -144,8 +144,470 @@ def _validate_url(url: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+class SearchResult:
+    """Structured internal result — the tool layer formats it back to a
+    string for the model (the model-facing contract stays unchanged)."""
+
+    __slots__ = ("success", "results", "error_type", "provider")
+
+    def __init__(
+        self,
+        success: bool,
+        results: list[dict[str, str]] | None = None,
+        error_type: str | None = None,
+        provider: str | None = None,
+    ):
+        self.success = success
+        self.results = results or []
+        # RATE_LIMIT | NETWORK | SERVER_ERROR | AUTH_ERROR | NO_KEY | NO_RESULT | None
+        self.error_type = error_type
+        self.provider = provider  # which provider produced this outcome (#804)
+
+
+# Error categories that should trigger fallback in auto mode.
+_FALLBACK_ERRORS = {"RATE_LIMIT", "NETWORK", "SERVER_ERROR", "NO_RESULT"}
+# Errors that must NOT silently fall back (config problems) — log, but
+# degrade to the keyless provider once so the user still gets an answer.
+_AUTH_ERRORS = {"AUTH_ERROR", "NO_KEY"}
+
+
+class SearchProvider:
+    """Uniform interface for a search backend."""
+
+    name = "base"
+
+    async def search(self, query: str, count: int) -> SearchResult:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+def _format_results(query: str, results: list[dict[str, str]]) -> str:
+    """Model-facing string format (unchanged from the old tool output)."""
+    lines = [f"Results for: {query}\n"]
+    for i, item in enumerate(results, 1):
+        title = item.get("title", "")
+        url = item.get("url", "")
+        # DeepSeek 搜索结果是总结文本，无来源 URL——不伪造可抓取地址（外部审阅 #844）
+        lines.append(f"{i}. {title}\n   {url}" if url else f"{i}. {title}")
+        if snippet := item.get("snippet"):
+            lines.append(f"   {snippet}")
+    return "\n".join(lines)
+
+
+class DDGSProvider(SearchProvider):
+    """DuckDuckGo via the ddgs library — keyless, always available."""
+
+    name = "ddgs"
+
+    async def search(self, query: str, count: int) -> SearchResult:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            return SearchResult(False, error_type="NETWORK")
+
+        last_error = "UNKNOWN"
+        # Rate limits are usually short-lived (seconds) — retry once with a
+        # small backoff before giving up and falling through the chain (#561).
+        for attempt in (1, 2):
+            try:
+                results = await asyncio.to_thread(
+                    lambda: list(
+                        DDGS().text(
+                            query,
+                            max_results=count,
+                            backend="html,lite",  # multiple endpoints, more resilient
+                        )
+                    )
+                )
+                if not results:
+                    return SearchResult(True, error_type="NO_RESULT")
+                out = []
+                for item in results[:count]:
+                    href = item.get("href") or item.get("url", "")
+                    if not href:
+                        continue
+                    out.append({
+                        "title": item.get("title", ""),
+                        "url": href,
+                        "snippet": item.get("body") or item.get("description", ""),
+                    })
+                if not out:
+                    return SearchResult(True, error_type="NO_RESULT")
+                return SearchResult(True, out)
+            except Exception as e:
+                cls = type(e).__name__
+                if "Ratelimit" in cls:
+                    last_error = "RATE_LIMIT"
+                elif "Timeout" in cls:
+                    last_error = "NETWORK"
+                else:
+                    last_error = "SERVER_ERROR"
+                if attempt == 1:
+                    await asyncio.sleep(3.0)  # short backoff before retry
+        return SearchResult(False, error_type=last_error)
+
+
+class BraveProvider(SearchProvider):
+    """Brave Search API — requires BRAVE_API_KEY."""
+
+    name = "brave"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    async def search(self, query: str, count: int) -> SearchResult:
+        if not self.api_key:
+            return SearchResult(False, error_type="NO_KEY", provider="brave")
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={"q": query, "count": count},
+                    headers={"Accept": "application/json",
+                             "X-Subscription-Token": self.api_key},
+                    timeout=10.0,
+                )
+                if r.status_code == 429:
+                    return SearchResult(False, error_type="RATE_LIMIT", provider="brave")
+                if r.status_code in (401, 403):
+                    return SearchResult(False, error_type="AUTH_ERROR", provider="brave")
+                if r.status_code >= 500:
+                    return SearchResult(False, error_type="SERVER_ERROR", provider="brave")
+                r.raise_for_status()
+
+            items = r.json().get("web", {}).get("results", [])
+            out = [
+                {"title": it.get("title", ""), "url": it.get("url", ""),
+                 "snippet": it.get("description", "")}
+                for it in items[:count] if it.get("url")
+            ]
+            if not out:
+                return SearchResult(True, error_type="NO_RESULT", provider="brave")
+            return SearchResult(True, out, provider="brave")
+        except httpx.TimeoutException:
+            return SearchResult(False, error_type="NETWORK", provider="brave")
+        except httpx.HTTPStatusError:
+            return SearchResult(False, error_type="SERVER_ERROR", provider="brave")
+        except Exception:
+            return SearchResult(False, error_type="NETWORK", provider="brave")
+
+
+class TavilyProvider(SearchProvider):
+    """Tavily Search API (https://tavily.com) — AI-friendly, structured."""
+
+    name = "tavily"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    async def search(self, query: str, count: int) -> SearchResult:
+        if not self.api_key:
+            return SearchResult(False, error_type="NO_KEY", provider="tavily")
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://api.tavily.com/search",
+                    json={"query": query, "max_results": count},
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=10.0,
+                )
+                if r.status_code == 429:
+                    return SearchResult(False, error_type="RATE_LIMIT", provider="tavily")
+                if r.status_code in (401, 403):
+                    return SearchResult(False, error_type="AUTH_ERROR", provider="tavily")
+                if r.status_code >= 500:
+                    return SearchResult(False, error_type="SERVER_ERROR", provider="tavily")
+                r.raise_for_status()
+
+            items = r.json().get("results", [])
+            out = [
+                {"title": it.get("title", ""), "url": it.get("url", ""),
+                 "snippet": it.get("content", "")}
+                for it in items[:count] if it.get("url")
+            ]
+            if not out:
+                return SearchResult(True, error_type="NO_RESULT", provider="tavily")
+            return SearchResult(True, out, provider="tavily")
+        except httpx.TimeoutException:
+            return SearchResult(False, error_type="NETWORK", provider="tavily")
+        except httpx.HTTPStatusError:
+            return SearchResult(False, error_type="SERVER_ERROR", provider="tavily")
+        except Exception:
+            return SearchResult(False, error_type="NETWORK", provider="tavily")
+
+
+def _is_official_deepseek_base(api_base: str) -> bool:
+    """DeepSeek 官方 base 判断（hostname 精确 + HTTPS 强制，避免子串/明文误判）。
+
+    /responses 端点是官方专属——中转站/腾讯云只有 chat/completions。
+    http:// 明文会泄露 bearer token，拒绝（CodeRabbit #844）。
+    """
+    try:
+        p = urlparse(api_base or "")
+    except ValueError:
+        return False
+    return p.scheme == "https" and p.hostname == "api.deepseek.com"
+
+
+def _model_is_deepseek(model: str | None) -> bool:
+    """当前对话模型是否为 DeepSeek（"对应模型的联网搜索"判定）。
+
+    兼容 "deepseek/deepseek-v4-flash"（provider 前缀）与
+    "deepseek-v4-flash"（裸模型名）两种写法。
+    """
+    if not model:
+        return False
+    m = model.strip().lower()
+    return m == "deepseek" or m.startswith("deepseek/") or m.startswith("deepseek-")
+
+
+class DeepSeekSearchProvider(SearchProvider):
+    """DeepSeek 官方联网搜索（Responses API，复用 LLM key，零配置）。
+
+    仅支持官方 api_base（api.deepseek.com）——中转站/腾讯云没有 /responses
+    端点。模型自动拆多查询 + 打开原文核实，返回已总结文本（含来源）。
+    一次搜索 ≈ 7K tokens（约 0.3 分钱），medium 档实测 ~8s。
+    """
+
+    name = "deepseek"
+
+    def __init__(self, api_key: str, api_base: str = "https://api.deepseek.com",
+                 timeout: float = 30.0, model: str | None = None):
+        self.api_key = api_key
+        self.api_base = (api_base or "https://api.deepseek.com").rstrip("/")
+        self.timeout = timeout
+        # 跟随用户模型（去 provider 前缀，如 deepseek/deepseek-chat → deepseek-chat）；
+        # 非 deepseek 模型/未知时用 deepseek-v4-flash 兜底（CodeRabbit #844）
+        self.model = model or ""
+
+    def _resolve_model(self) -> str:
+        m = self.model.strip()
+        if m.startswith("deepseek/"):
+            m = m.split("/", 1)[1]
+        # v4 系列跟随用户模型；legacy（deepseek-chat/reasoner）与未知用 flash——
+        # 实测 legacy + 强制 tool_choice 只返回 web_search_call 无总结文本（NO_RESULT）
+        if m.startswith("deepseek-v4-"):
+            return m
+        return "deepseek-v4-flash"
+
+    async def search(self, query: str, count: int) -> SearchResult:
+        if not self.api_key:
+            return SearchResult(False, error_type="NO_KEY", provider="deepseek")
+        if not _is_official_deepseek_base(self.api_base):
+            return SearchResult(False, error_type="UNSUPPORTED", provider="deepseek")
+        # 实测 medium ~8s（与消费端一致）；high 35s 超过客户端超时，一律 medium
+        #（外部审阅 #844：count>=8 选 high 会 30s 必超时）
+        context = "medium"
+        # 规范化：官方 base 可能带 /v1（配置自动填充）——统一走文档化 /responses 路径
+        url = f"{self.api_base.rstrip('/').removesuffix('/v1')}/responses"
+        try:
+            async with asyncio.timeout(self.timeout):
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(self.timeout, connect=8.0, write=8.0, pool=8.0)
+                ) as client:
+                    r = await client.post(
+                        url,
+                        json={
+                            "model": self._resolve_model(),
+                            "input": query,
+                            "tools": [{"type": "web_search", "web_search": {"context_size": context}}],
+                            # 强制 web_search：防止"仅文本输出"被当成成功结果（CodeRabbit #844）
+                            "tool_choice": {"type": "web_search"},
+                        },
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                    )
+                    if r.status_code == 429:
+                        return SearchResult(False, error_type="RATE_LIMIT", provider="deepseek")
+                    if r.status_code in (401, 403):
+                        return SearchResult(False, error_type="AUTH_ERROR", provider="deepseek")
+                    if r.status_code == 402:
+                        # 预付账户余额不足——专属分类，不能当"服务端错误"（外部审阅 #844）
+                        return SearchResult(False, error_type="BALANCE_ERROR", provider="deepseek")
+                    if r.status_code >= 500:
+                        return SearchResult(False, error_type="SERVER_ERROR", provider="deepseek")
+                    r.raise_for_status()
+
+            data = r.json()
+            # 仅 completed 视为成功（failed/incomplete → 走 fallback 链，CodeRabbit #844）
+            if data.get("status") not in (None, "completed"):
+                return SearchResult(False, error_type="SERVER_ERROR", provider="deepseek")
+            text = ""
+            for item in data.get("output", []):
+                if item.get("type") != "message":
+                    continue
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text" and c.get("text"):
+                        text = c["text"]
+            if not text:
+                # completed 但无输出（被拒/内容过滤等）——按失败回落，不能当"成功无结果"
+                # 短路整条链（外部审阅 #844）
+                return SearchResult(False, error_type="NO_RESULT", provider="deepseek")
+            return SearchResult(True, [{
+                "title": "DeepSeek 联网搜索（官方）",
+                "url": "",  # 总结文本无来源 URL——不伪造可抓取地址（外部审阅 #844）
+                "snippet": text,
+            }], provider="deepseek")
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            return SearchResult(False, error_type="NETWORK", provider="deepseek")
+        except httpx.HTTPStatusError:
+            return SearchResult(False, error_type="SERVER_ERROR", provider="deepseek")
+        except Exception:
+            return SearchResult(False, error_type="NETWORK", provider="deepseek")
+
+
+class SearchProviderManager:
+    """Orchestrates providers for the configured search strategy.
+
+    provider=auto: Tavily(if key) → Brave(if key) → DDGS — falling through
+    on RATE_LIMIT/NETWORK/SERVER_ERROR.  AUTH_ERROR degrades straight to the
+    keyless provider with a warning (never silently loops).
+    """
+
+    _PROVIDERS = {
+        "tavily": TavilyProvider,
+        "brave": BraveProvider,
+        "ddgs": DDGSProvider,
+        "deepseek": DeepSeekSearchProvider,
+    }
+
+    def __init__(
+        self,
+        provider: str,
+        *,
+        model: str | None = None,
+        model_provider: Callable[[], str | None] | None = None,
+        tavily_api_key: str = "",
+        brave_api_key: str = "",
+        deepseek_api_key: str = "",
+        deepseek_api_base: str = "https://api.deepseek.com",
+    ):
+        self.model = model
+        # 动态模型解析：每次 _chain() 时重读（配置改动即时生效，外部审阅 #844）
+        self._model_provider = model_provider
+        self.tavily_api_key = tavily_api_key
+        self.brave_api_key = brave_api_key
+        self.deepseek_api_key = deepseek_api_key
+        self.deepseek_api_base = (deepseek_api_base or "https://api.deepseek.com").rstrip("/")
+        name = (provider or "auto").lower()
+        # Old "hybrid" value means the auto fallback chain now.
+        self.provider = "auto" if name in {"auto", "hybrid"} else name
+        if self.provider not in self._PROVIDERS:
+            self.provider = "auto"
+
+    def _current_model(self) -> str | None:
+        if self._model_provider is not None:
+            return self._model_provider()
+        return self.model
+
+    def _make(self, name: str) -> SearchProvider | None:
+        if name == "tavily":
+            return TavilyProvider(self.tavily_api_key)
+        if name == "brave":
+            return BraveProvider(self.brave_api_key)
+        if name == "ddgs":
+            return DDGSProvider()
+        if name == "deepseek":
+            return DeepSeekSearchProvider(self.deepseek_api_key, self.deepseek_api_base,
+                                          model=self._current_model() or "")
+        return None
+
+    def _chain(self) -> list[SearchProvider]:
+        if self.provider != "auto":
+            return [self._make(self.provider)]
+        chain = []
+        # ① 对话模型对应的官方联网搜索优先（如 DeepSeek /responses，零配置复用
+        #    模型 key）；② 配了 key 的第三方搜索（Tavily/Brave，快）；
+        #    ③ DDGS 兜底
+        if (
+            _model_is_deepseek(self._current_model())
+            and self.deepseek_api_key
+            and _is_official_deepseek_base(self.deepseek_api_base)
+        ):
+            chain.append(DeepSeekSearchProvider(
+                self.deepseek_api_key, self.deepseek_api_base,
+                model=self._current_model() or "",
+            ))
+        if self.tavily_api_key:
+            chain.append(TavilyProvider(self.tavily_api_key))
+        if self.brave_api_key:
+            chain.append(BraveProvider(self.brave_api_key))
+        chain.append(DDGSProvider())
+        return chain
+
+    async def search(self, query: str, count: int) -> SearchResult:
+        chain = self._chain()
+        last_auth_warned = False
+        last_failure: SearchResult | None = None
+        for provider in chain:
+            result = await provider.search(query, count)
+            if result.success:
+                return result
+            # Tag the failing provider for error surfacing (#804).
+            if not result.provider:
+                result.provider = provider.name
+            last_failure = result
+            if result.error_type in _FALLBACK_ERRORS:
+                logging.getLogger(__name__).warning(
+                    "web_search: %s failed (%s), trying next provider",
+                    provider.name, result.error_type,
+                )
+                continue
+            if result.error_type in _AUTH_ERRORS:
+                if not last_auth_warned:
+                    logging.getLogger(__name__).warning(
+                        "web_search: %s authentication failed — check API key",
+                        provider.name,
+                    )
+                    last_auth_warned = True
+                continue  # degrade to the next (keyless) provider once
+            return result  # NO_RESULT etc. — not a fallback condition
+        # Whole chain exhausted — surface the last real failure instead of a
+        # generic SERVER_ERROR so the model/user can act on it (#804).
+        if last_failure is not None:
+            return SearchResult(
+                False,
+                error_type=last_failure.error_type or "SERVER_ERROR",
+                provider=last_failure.provider,
+            )
+        return SearchResult(False, error_type="SERVER_ERROR")
+
+
+# Model/user-facing reason mapping for failed searches (#804: surface the
+# actionable cause instead of an abstract error).
+_ERROR_REASONS: dict[str, str] = {
+    "NO_KEY": "未配置 {provider} API key，请在设置中填写",
+    "AUTH_ERROR": "{provider} API key 无效（401/403），请在设置中检查",
+    "BALANCE_ERROR": "{provider} 账户余额不足（402），请充值后重试",
+    "RATE_LIMIT": "搜索服务限流（429），请稍后重试",
+    "NETWORK": "网络连接失败，请检查网络后重试",
+    "SERVER_ERROR": "搜索服务暂时不可用（服务端错误）",
+    "UNSUPPORTED": "当前 {provider} 服务商不支持联网搜索（仅官方 api.deepseek.com 支持）",
+}
+_PROVIDER_LABELS: dict[str, str] = {
+    "tavily": "Tavily",
+    "brave": "Brave",
+    "ddgs": "DuckDuckGo",
+    "deepseek": "DeepSeek",
+}
+
+
+def _failure_message(result: SearchResult) -> str:
+    """Human-readable, model-actionable failure message for web_search."""
+    label = _PROVIDER_LABELS.get(result.provider or "", result.provider or "")
+    template = _ERROR_REASONS.get(result.error_type or "")
+    if template is None:
+        reason = f"未知错误（{result.error_type or 'unknown'}）"
+    else:
+        reason = template.format(provider=label or "搜索")
+    provider_hint = f"（服务：{label}）" if label else ""
+    return (
+        f"Error: 网络搜索失败{provider_hint}。原因：{reason}。"
+        "请勿尝试用 web_fetch 抓取搜索引擎页面（会被拒绝且结果不可用）。"
+        "直接告知用户搜索暂不可用，或建议稍后重试。"
+    )
+
+
 class WebSearchTool(Tool):
-    """Search the web using ddgs by default, with optional Brave fallback."""
+    """Search the web. provider=auto falls back 对应模型搜索 → Tavily → Brave → DDGS."""
 
     name = "web_search"
     description = "Search the web. Returns titles, URLs, and snippets."
@@ -167,82 +629,81 @@ class WebSearchTool(Tool):
         self,
         api_key: str | None = None,
         max_results: int = 5,
-        provider: str = "ddgs",
+        provider: str = "auto",
+        model: str | None = None,
+        model_provider: Callable[[], str | None] | None = None,
+        tavily_api_key: str | None = None,
+        brave_api_key: str | None = None,
+        deepseek_api_key: str | None = None,
+        deepseek_api_base: str = "https://api.deepseek.com",
     ):
-        provider_name = (provider or "ddgs").lower()
-        self.provider = provider_name if provider_name in {"ddgs", "brave", "hybrid"} else "ddgs"
-        self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
+        self.manager = SearchProviderManager(
+            provider,
+            # 当前对话模型：决定"对应模型的联网搜索"（如 DeepSeek）；model_provider
+            # 优先（每次链构建动态读取，配置换模型即时生效）
+            model=model,
+            model_provider=model_provider,
+            # legacy api_key was the Brave key — never feed it to Tavily (#561)
+            tavily_api_key=tavily_api_key or os.environ.get("TAVILY_API_KEY", ""),
+            brave_api_key=brave_api_key or api_key or os.environ.get("BRAVE_API_KEY", ""),
+            # DeepSeek 联网搜索复用 LLM key（零配置；仅官方 base 生效）
+            deepseek_api_key=deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY", ""),
+            deepseek_api_base=deepseek_api_base or "https://api.deepseek.com",
+        )
         self.max_results = max_results
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         n = min(max(count or self.max_results, 1), 10)
 
-        if self.provider == "brave":
-            return await self._brave_search(query, n)
-        if self.provider == "hybrid":
-            result = await self._ddgs_search(query, n)
-            if not result.startswith("Error:"):
-                return result
-            return await self._brave_search(query, n)
-        return await self._ddgs_search(query, n)
+        # Reasoning mode (issue #680): fast mode fans out into parallel
+        # queries + fetches via SearchOrchestrator; think mode = current path.
+        search_strategy = kwargs.get("_search_strategy")
+        if search_strategy is not None and getattr(search_strategy, "fanout_queries", 1) > 1:
+            from miqi.agent.search_orchestrator import SearchOrchestrator
 
-    async def _ddgs_search(self, query: str, n: int) -> str:
-        try:
-            from ddgs import DDGS
-        except ImportError:
-            return "Error: ddgs package not installed"
+            orchestrator = SearchOrchestrator(search_tool=self, fetch_tool=WebFetchTool())
+            return await orchestrator.run(query, search_strategy, n_results=n)
 
+        result = await self.manager.search(query, n)
+        if not result.success:
+            return _failure_message(result)
+        if result.error_type == "NO_RESULT":
+            return f"No results for: {query}"
+        return _format_results(query, result.results)
+
+    async def _parallel_search(self, query: str, n_queries: int, n: int) -> list[str]:
+        """#804: fast 模式扇出搜索先走**配置的 provider 链**（对应模型搜索 → Tavily → Brave → DDGS），
+        不再被 SearchOrchestrator 直接 ddgs 绕过——用户配的 key 在 fast 模式
+        同样生效（#748 的 fallback 链在默认 fast 路径下此前是死代码）。链失败
+        /空结果才回退 ddgs 区域变体（原 orchestrator 内置逻辑，含 15s 超时）；
+        两者都失败时透出配置链的最后失败原因，不让模型误读为"无结果"。
+        显式选择引擎时（provider != auto）不回退 ddgs——尊重显式语义
+        （如"仅使用 DeepSeek"），失败直接透出原因（外部审阅 #844）。
+        """
+        last_failure: SearchResult | None = None
         try:
-            results = await asyncio.to_thread(
-                lambda: list(DDGS().text(query, max_results=n))
+            result = await self.manager.search(query, n)
+            if result.success and result.results:
+                return [_format_results(query, result.results)]
+            last_failure = result
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "web_search parallel: manager chain failed for %r — falling back to ddgs",
+                query[:60],
             )
-            if not results:
-                return f"No results for: {query}"
+        if self.manager.provider != "auto":
+            # 显式引擎：不静默回落，透出失败原因
+            if last_failure is not None and not last_failure.success:
+                return [_failure_message(last_failure)]
+            return []
+        from miqi.agent.search_orchestrator import _ddgs_regional_search
 
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results[:n], 1):
-                title = item.get("title", "")
-                href = item.get("href") or item.get("url", "")
-                body = item.get("body") or item.get("description", "")
-                lines.append(f"{i}. {title}\n   {href}")
-                if body:
-                    lines.append(f"   {body}")
-            return "\n".join(lines)
-        except Exception as e:
-            return (
-                f"Error: web search failed: {e}. 搜索服务暂不可用——请勿尝试用 "
-                "web_fetch 抓取搜索引擎页面（会被拒绝且结果不可用）。"
-                "直接告知用户搜索暂不可用，或建议稍后重试。"
-            )
-
-    async def _brave_search(self, query: str, n: int) -> str:
-        if not self.api_key:
-            return "Error: BRAVE_API_KEY not configured"
-
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    "https://api.search.brave.com/res/v1/web/search",
-                    params={"q": query, "count": n},
-                    headers={"Accept": "application/json",
-                             "X-Subscription-Token": self.api_key},
-                    timeout=10.0,
-                )
-                r.raise_for_status()
-
-            results = r.json().get("web", {}).get("results", [])
-            if not results:
-                return f"No results for: {query}"
-
-            lines = [f"Results for: {query}\n"]
-            for i, item in enumerate(results[:n], 1):
-                lines.append(
-                    f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
-                if desc := item.get("description"):
-                    lines.append(f"   {desc}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Error: {e}"
+        blocks = await _ddgs_regional_search(query, n_queries, n)
+        if blocks:
+            return blocks
+        if last_failure is not None and not last_failure.success:
+            return [_failure_message(last_failure)]
+        return []
 
 
 class WebFetchTool(Tool):
@@ -310,11 +771,33 @@ class WebFetchTool(Tool):
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
 
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True, max_redirects=MAX_REDIRECTS, timeout=30.0
-            ) as client:
-                r = await client.get(url, headers={"User-Agent": USER_AGENT})
+            # 手动跟随重定向，每跳都验证目标 URL（CodeRabbit #741：公共 URL
+            # 可重定向到内网/元数据地址，自动 follow_redirects 会绕过 _validate_url）。
+            current = url
+            for _ in range(MAX_REDIRECTS + 1):
+                async with httpx.AsyncClient(
+                    follow_redirects=False, timeout=30.0
+                ) as client:
+                    r = await client.get(current, headers={"User-Agent": USER_AGENT})
+                if r.status_code in (301, 302, 303, 307, 308):
+                    location = r.headers.get("location")
+                    if not location:
+                        break
+                    next_url = str(httpx.URL(current).join(location))
+                    is_valid, error_msg = _validate_url(next_url)
+                    if not is_valid:
+                        return json.dumps(
+                            {"error": f"Redirect target rejected: {error_msg}", "url": next_url},
+                            ensure_ascii=False,
+                        )
+                    current = next_url
+                    continue
                 r.raise_for_status()
+                break
+            else:
+                return json.dumps(
+                    {"error": "Too many redirects", "url": url}, ensure_ascii=False
+                )
 
             ctype = r.headers.get("content-type", "")
 

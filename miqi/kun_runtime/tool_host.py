@@ -44,6 +44,7 @@ class ToolHostContext:
     workspace: str
     thread_mode: str | None = None
     approval_policy: str = "auto"
+    autonomy_mode: str = "supervised"  # collab gate: plan/manual/supervised/autonomous
     abort_signal: Any = None  # CancellationToken
     active_skill_ids: list[str] = field(default_factory=list)
     allowed_tool_names: list[str] | None = None
@@ -54,6 +55,18 @@ class ToolHostContext:
     # Callbacks
     await_approval: Callable[[dict[str, Any]], Coroutine[Any, Any, str]] | None = None
     await_user_input: Callable[[dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]] | None = None
+
+    # Reasoning mode (issue #680): fast = Answer-oriented, parallel search.
+    mode: str | None = None
+    search_strategy: Any = None
+    parallel_limit: int | None = None
+
+    # Directories the user mentioned in their message this turn (issue #821).
+    # The agent loop extracts them from user_message items; the tool host
+    # injects them as ``_user_roots`` so file tools can read/write the
+    # user-requested output dirs (e.g. Desktop/test_result) without static
+    # tools.extra_roots config.
+    user_mentioned_roots: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -69,6 +82,37 @@ class ToolHostResult:
 _PARALLEL_SAFE_NAMES = frozenset({"read", "grep", "find", "ls", "list_dir", "read_file", "web_search", "web_fetch", "paper_search", "paper_get"})
 _NEVER_PARALLEL_NAMES = frozenset({"exec", "bash", "message", "spawn", "cron", "write", "edit", "delete", "move", "apply_patch", "edit_diff"})
 _MAX_PARALLEL_TOOL_CALLS = 3
+
+# AI-initiated user confirmation (issue #646): blocking human-in-the-loop tool
+ASK_USER_CONFIRM_TOOL = "ask_user_confirm_card"
+
+# Tools that receive the injected ``_session_key`` (mirrors the legacy
+# ToolOrchestrator._execute_in_sandbox set).  Session isolation
+# (sessions/<key>/files) can only engage when the tool knows which session
+# is executing — the KUN tool host is the single execution point here, so it
+# must do the same injection or file writes land in the shared root.
+# graph_render is included for parity with the legacy orchestrator
+# (CodeRabbit #761) — it writes svg/html artifacts and reads source JSON.
+_SESSION_KEY_TOOLS = frozenset({
+    "exec",
+    "write_file", "edit_file", "delete_file", "apply_patch",
+    "read_file", "list_dir",
+    "docx_write", "pptx_write", "xlsx_write",
+    "create_docx", "create_pptx", "create_xlsx",
+    "create_pdf", "pdf_write", "pdf_read",
+    "edit_docx", "append_xlsx",
+    "paper_download",
+    "graph_render",
+})
+
+# File tools that accept the injected ``_user_roots`` — directories the
+# user mentioned in their message (issue #821), auto-sensed by the agent
+# loop.  Only file-ish tools consume them; injecting into every tool would
+# be harmless but pointless.
+_USER_ROOTS_TOOLS = frozenset({
+    "write_file", "edit_file", "read_file", "list_dir",
+    "apply_patch", "graph_render",
+})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -192,9 +236,133 @@ class MiQiToolHost:
                     "isError": True,
                 })
 
+        # Collaboration gate (issue #646, design v2): the harness — not the
+        # model — decides when a card is required. ask_user_confirm_card itself
+        # is exempt (it IS the card). External transfers / payments confirm in
+        # every autonomy mode; writes/exec confirm per the mode matrix.
+        from miqi.execution.collab_policy import (
+            AutonomyMode,
+            CollabVerdict,
+        )
+        from miqi.execution.collab_policy import (
+            evaluate as collab_evaluate,
+        )
+
+        if tool_name != ASK_USER_CONFIRM_TOOL:
+            try:
+                collab_verdict = collab_evaluate(tool_name, AutonomyMode(context.autonomy_mode))
+            except (ValueError, KeyError):
+                # Unparsable mode → evaluate under the most conservative mode
+                # instead of defaulting to ALLOW (CodeRabbit #711).
+                collab_verdict = collab_evaluate(tool_name, AutonomyMode.MANUAL)
+            if collab_verdict == CollabVerdict.DENY:
+                # DENY blocks in every context — including headless runs with
+                # no user-input channel (CodeRabbit #711).
+                return ToolHostResult(item={
+                    "kind": "tool_result",
+                    "id": f"item_{context.turn_id}_{call.call_id}",
+                    "turnId": context.turn_id,
+                    "threadId": context.thread_id,
+                    "role": "tool",
+                    "status": "failed",
+                    "createdAt": _now_iso(),
+                    "finishedAt": _now_iso(),
+                    "toolName": tool_name,
+                    "callId": call.call_id,
+                    "toolKind": _classify_tool_kind(tool_name),
+                    "output": f"Tool '{tool_name}' is blocked in {context.autonomy_mode} mode",
+                    "isError": True,
+                })
+            if (
+                collab_verdict == CollabVerdict.CONFIRM
+                and context.await_user_input is not None
+                # Reasoning mode (issue #680): fast = 信息型操作直接执行，
+                # 不弹确认卡（用户：极速模式完全不可能快）。权限型仍由
+                # ExecutionPolicy/approval 门控制。
+                and context.mode != "fast"
+            ):
+                gate_result = await context.await_user_input({
+                    "threadId": context.thread_id,
+                    "turnId": context.turn_id,
+                    "toolName": tool_name,
+                    "title": f"确认执行：{tool_name}",
+                    "message": f"该操作需要你确认后才会执行（当前模式：{context.autonomy_mode}）。",
+                    "choices": [
+                        {"id": "confirm", "label": "确认执行"},
+                        {"id": "cancel", "label": "取消"},
+                    ],
+                    "timeout_seconds": 120,
+                })
+                answers = gate_result.get("answers") or {}
+                if gate_result.get("status") != "submitted" or answers.get("choice_id") != "confirm":
+                    return ToolHostResult(item={
+                        "kind": "tool_result",
+                        "id": f"item_{context.turn_id}_{call.call_id}",
+                        "turnId": context.turn_id,
+                        "threadId": context.thread_id,
+                        "role": "tool",
+                        "status": "cancelled",
+                        "createdAt": _now_iso(),
+                        "finishedAt": _now_iso(),
+                        "toolName": tool_name,
+                        "callId": call.call_id,
+                        "toolKind": _classify_tool_kind(tool_name),
+                        "output": "User cancelled the operation (policy confirmation).",
+                        "isError": True,
+                    })
+            # CONFIRM without a wired channel (headless/CLI): fall through to
+            # normal execution — the safety approval layer still backstops
+            # dangerous commands.
+
+        # AI-initiated user confirmation (issue #646): ask_user_confirm_card
+        # is a blocking human-in-the-loop tool. When the user-input channel is
+        # wired (KUN runtime), route through await_user_input so the desktop
+        # renders an inline confirm card and the turn pauses for the choice.
+        if (
+            tool_name == ASK_USER_CONFIRM_TOOL
+            and context.await_user_input is not None
+        ):
+            return await self._execute_user_confirm(call, context, args)
+
         # Execute
         try:
-            result = await self._registry.execute(tool_name, args)
+            # Session isolation: inject the session key for file/exec tools so
+            # per-session workspace isolation engages on the KUN runtime (the
+            # legacy orchestrator does the same via _execute_in_sandbox).
+            # thread_id → session_key mapping when registered (gateway flows),
+            # otherwise the thread id itself is the session key.
+            extra: dict[str, Any] = {}
+            if tool_name in _SESSION_KEY_TOOLS:
+                from miqi.kun_runtime.migration_adapter import thread_id_to_session_key
+
+                session_key = thread_id_to_session_key(context.thread_id) or context.thread_id
+                if session_key:
+                    extra["_session_key"] = session_key
+            if tool_name.startswith("mcp_"):
+                # MCP 工具（issue #927）：注入会话上下文供 slurm 计费事件
+                # 使用（MCPToolWrapper 会 pop 掉，不传给 MCP 服务端）。
+                from miqi.kun_runtime.migration_adapter import (
+                    thread_id_to_session_key,
+                )
+
+                extra["_session_key"] = (
+                    thread_id_to_session_key(context.thread_id)
+                    or context.thread_id
+                )
+                extra["_turn_id"] = context.turn_id
+                extra["_tool_call_id"] = call.call_id
+            # User-mentioned output dirs (issue #821): pass the turn's
+            # auto-sensed roots to file tools so the user's explicitly
+            # requested output location (e.g. Desktop/test_result) works
+            # without static tools.extra_roots config.
+            if tool_name in _USER_ROOTS_TOOLS and context.user_mentioned_roots:
+                extra["_user_roots"] = list(context.user_mentioned_roots)
+            # Reasoning mode (issue #680): hand the fast-mode search strategy
+            # to web_search so it can fan out (parallel queries + fetches).
+            if tool_name == "web_search" and context.search_strategy is not None:
+                extra["_search_strategy"] = context.search_strategy
+                extra["_mode"] = context.mode or ""
+            result = await self._registry.execute(tool_name, args, **extra)
             is_error = isinstance(result, str) and result.startswith("Error")
         except asyncio.TimeoutError:
             result = f"Tool '{tool_name}' timed out"
@@ -216,6 +384,53 @@ class MiQiToolHost:
             "toolName": tool_name,
             "callId": call.call_id,
             "toolKind": _classify_tool_kind(tool_name),
+            "output": result,
+            "isError": is_error,
+        })
+
+    async def _execute_user_confirm(
+        self,
+        call: ToolCallLike,
+        context: ToolHostContext,
+        args: dict[str, Any],
+    ) -> ToolHostResult:
+        """Execute the blocking ask_user_confirm_card tool via the user-input gate.
+
+        The turn pauses until the user picks a choice, times out, or the turn
+        is cancelled. Returns the structured decision as a tool result so the
+        model can continue / abort / re-plan.
+        """
+        from miqi.agent.tools.ask_user_confirm import AskUserConfirmCardTool
+
+        try:
+            payload = AskUserConfirmCardTool.normalize_args(args)
+            gate_result = await context.await_user_input({
+                "threadId": context.thread_id,
+                "turnId": context.turn_id,
+                "toolName": call.tool_name,
+                **payload,
+            })
+            result = AskUserConfirmCardTool.build_result(gate_result)
+            is_error = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("ask_user_confirm_card failed")
+            result = f"Error: 用户确认失败：{exc}"
+            is_error = True
+
+        return ToolHostResult(item={
+            "kind": "tool_result",
+            "id": f"item_{context.turn_id}_{call.call_id}",
+            "turnId": context.turn_id,
+            "threadId": context.thread_id,
+            "role": "tool",
+            "status": "failed" if is_error else "completed",
+            "createdAt": _now_iso(),
+            "finishedAt": _now_iso(),
+            "toolName": call.tool_name,
+            "callId": call.call_id,
+            "toolKind": _classify_tool_kind(call.tool_name),
             "output": result,
             "isError": is_error,
         })

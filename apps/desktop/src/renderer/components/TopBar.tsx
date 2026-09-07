@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useRuntime } from '../contexts/RuntimeContext';
 import { AlertTriangle, RefreshCw, Loader2, Folder } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { MiQiLogo } from './MiQiLogo';
+import { MiQroForgeLogo } from './MiQroForgeLogo';
 
 interface ApprovalBypassStatus {
   bypassAll?: boolean;
@@ -25,12 +25,13 @@ function isBypassEnabled(status: ApprovalBypassStatus | null): boolean {
 
 function isAllBypassOn(status: ApprovalBypassStatus | null): boolean {
   if (!status) return false;
-  return !!(status.bypassAll || (
-    status.bypassCommandApproval &&
-    status.bypassFileWriteApproval &&
-    status.bypassToolConfirmation &&
-    status.bypassNetworkApproval
-  ));
+  return !!(
+    status.bypassAll ||
+    (status.bypassCommandApproval &&
+      status.bypassFileWriteApproval &&
+      status.bypassToolConfirmation &&
+      status.bypassNetworkApproval)
+  );
 }
 
 function getBypassLabel(status: ApprovalBypassStatus | null, autoMode: boolean): string {
@@ -47,9 +48,7 @@ function getBypassTitle(status: ApprovalBypassStatus | null, autoMode: boolean =
   if (status?.bypassFileWriteApproval) labels.push('文件写入审批');
   if (status?.bypassToolConfirmation) labels.push('工具确认');
   if (status?.bypassNetworkApproval) labels.push('网络审批');
-  return labels.length > 0
-    ? `已绕过: ${labels.join('、')}`
-    : '打开审批设置';
+  return labels.length > 0 ? `已绕过: ${labels.join('、')}` : '打开审批设置';
 }
 
 function formatWorkspace(workspace: string): string {
@@ -63,15 +62,31 @@ function formatWorkspace(workspace: string): string {
   return display;
 }
 
-export function TopBar({ onOpenApprovals, workspace }: { onOpenApprovals?: () => void; workspace?: string }) {
-  const { status } = useRuntime();
+export function TopBar({
+  onOpenApprovals,
+  workspace,
+}: {
+  onOpenApprovals?: () => void;
+  workspace?: string;
+}) {
+  const { status, start } = useRuntime();
   const [approvalBypass, setApprovalBypass] = useState<ApprovalBypassStatus | null>(null);
   const [bypassHovered, setBypassHovered] = useState(false);
   const [autoMode, setAutoMode] = useState(() => sessionStorage.getItem('miqi:mode:auto') === '1');
 
   const isRunning = status.state === 'running';
   const isStarting = status.state === 'starting' || status.state === 'stopping';
+  const isOffline = !isRunning && !isStarting;
   const bypassEnabled = isBypassEnabled(approvalBypass) || autoMode;
+
+  const handleStatusClick = async () => {
+    if (!isOffline) return;
+    try {
+      await start();
+    } catch {
+      // start 失败时状态会由 onStateChange / refreshStatus 更新为 error，无需额外处理
+    }
+  };
 
   // Listen for auto mode changes
   useEffect(() => {
@@ -143,7 +158,7 @@ export function TopBar({ onOpenApprovals, workspace }: { onOpenApprovals?: () =>
           className="text-sm font-semibold tracking-tight"
           style={{ color: 'var(--topbar-text)' }}
         >
-          MiQi
+          MiQroForge
         </span>
         <span className="text-xs font-light opacity-50" style={{ color: 'var(--topbar-text)' }}>
           Desktop
@@ -166,46 +181,69 @@ export function TopBar({ onOpenApprovals, workspace }: { onOpenApprovals?: () =>
           </div>
         )}
         {bypassEnabled && (
-            <button
-              type="button"
-              onClick={onOpenApprovals}
-              onMouseEnter={() => setBypassHovered(true)}
-              onMouseLeave={() => setBypassHovered(false)}
-              onFocus={() => setBypassHovered(true)}
-              onBlur={() => setBypassHovered(false)}
-              aria-label={getBypassTitle(approvalBypass, autoMode)}
-              title={getBypassTitle(approvalBypass, autoMode)}
-              className="flex items-center rounded-full text-[11px] font-medium overflow-hidden h-6 shrink-0"
-              style={{
-                color: 'var(--approval-warning)',
-                background: bypassHovered
-                  ? 'color-mix(in srgb, var(--approval-warning-bg) 80%, transparent)'
-                  : 'color-mix(in srgb, var(--approval-warning-bg) 50%, transparent)',
-                border: '1px solid var(--approval-warning-border)',
-                transition: 'background 0.2s ease',
-              }}
-            >
-              <span className="flex items-center gap-1 px-2.5 whitespace-nowrap shrink-0">
-                <AlertTriangle size={10} className="shrink-0" />
-                <span>{getBypassLabel(approvalBypass, autoMode)}</span>
+          <button
+            type="button"
+            onClick={onOpenApprovals}
+            onMouseEnter={() => setBypassHovered(true)}
+            onMouseLeave={() => setBypassHovered(false)}
+            onFocus={() => setBypassHovered(true)}
+            onBlur={() => setBypassHovered(false)}
+            aria-label={getBypassTitle(approvalBypass, autoMode)}
+            title={getBypassTitle(approvalBypass, autoMode)}
+            className="flex items-center rounded-full text-size-2xs font-medium overflow-hidden h-6 shrink-0"
+            style={{
+              color: 'var(--approval-warning)',
+              background: bypassHovered
+                ? 'color-mix(in srgb, var(--approval-warning-bg) 80%, transparent)'
+                : 'color-mix(in srgb, var(--approval-warning-bg) 50%, transparent)',
+              border: '1px solid var(--approval-warning-border)',
+              transition: 'background 0.2s ease',
+            }}
+          >
+            <span className="flex items-center gap-1 px-2.5 whitespace-nowrap shrink-0">
+              <AlertTriangle size={10} className="shrink-0" />
+              <span>{getBypassLabel(approvalBypass, autoMode)}</span>
+            </span>
+            {bypassDetailText && (
+              <span
+                className="whitespace-nowrap overflow-hidden pr-2.5"
+                style={{
+                  maxWidth: bypassHovered ? '400px' : '0px',
+                  opacity: bypassHovered ? 1 : 0,
+                  transition: 'max-width 0.3s ease, opacity 0.25s ease',
+                }}
+              >
+                <span style={{ color: 'var(--text-muted)' }}>{bypassDetailText}</span>
               </span>
-              {bypassDetailText && (
-                <span
-                  className="whitespace-nowrap overflow-hidden pr-2.5"
-                  style={{
-                    maxWidth: bypassHovered ? '400px' : '0px',
-                    opacity: bypassHovered ? 1 : 0,
-                    transition: 'max-width 0.3s ease, opacity 0.25s ease',
-                  }}
-                >
-                  <span style={{ color: 'var(--text-muted)' }}>{bypassDetailText}</span>
-                </span>
-              )}
-            </button>
+            )}
+          </button>
         )}
         {/* Sync state */}
-        <div
-          className={cn('flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium')}
+        <button
+          type="button"
+          data-testid="runtime-status-capsule"
+          onClick={handleStatusClick}
+          disabled={isRunning || isStarting}
+          title={
+            isRunning
+              ? '运行时已连接'
+              : isStarting
+                ? '正在启动/停止运行时…'
+                : '运行时未连接，点击重新连接'
+          }
+          aria-label={
+            isRunning
+              ? '运行时已连接'
+              : isStarting
+                ? '正在启动/停止运行时'
+                : '运行时未连接，点击重新连接'
+          }
+          className={cn(
+            'flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium',
+            isOffline &&
+              'cursor-pointer hover:brightness-95 active:brightness-90 transition-[filter]',
+            !isOffline && 'cursor-default'
+          )}
           style={{
             background: isRunning
               ? 'var(--success-bg)'
@@ -217,15 +255,18 @@ export function TopBar({ onOpenApprovals, workspace }: { onOpenApprovals?: () =>
         >
           {isStarting ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
           <span>{isRunning ? '已同步' : isStarting ? '同步中' : '离线'}</span>
-        </div>
+        </button>
       </div>
 
       {/* Right: user avatar */}
       <div className="flex items-center gap-2">
-        <span className="text-xs font-medium hidden sm:block" style={{ color: 'var(--topbar-text)' }}>
-          MiQi 智能体
+        <span
+          className="text-xs font-medium hidden sm:block"
+          style={{ color: 'var(--topbar-text)' }}
+        >
+          MiQroForge 智能体
         </span>
-        <MiQiLogo size={28} />
+        <MiQroForgeLogo size={28} />
       </div>
     </div>
   );

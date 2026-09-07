@@ -288,8 +288,9 @@ class TestAgentLoopGates:
         thread_id, turn_id = await _setup_thread_and_turn(thread_store, turn_svc)
 
         status = await loop.run_turn(thread_id, turn_id)
-        # Model errors in the loop stop the turn
-        assert status in ("completed", "failed")  # may complete with no tool calls
+        # Model errors in the loop stop the turn with a failed status
+        # (loop.py: stop_reason == "error" → "failed")
+        assert status == "failed"
 
         events_list = bus.history(thread_id)
         assert any(e.get("kind") == "error" for e in events_list)
@@ -298,7 +299,8 @@ class TestAgentLoopGates:
 class TestAgentLoopCompaction:
     @pytest.mark.asyncio
     async def test_compaction_triggers_on_large_history(
-        self, loop_opts: AgentLoopOptions, thread_store: FileThreadStore, turn_svc: TurnService, session_store: FileSessionStore
+        self, loop_opts: AgentLoopOptions, thread_store: FileThreadStore, turn_svc: TurnService,
+        session_store: FileSessionStore, bus: EventBus,
     ) -> None:
         """Compaction should trigger when history is large."""
         loop_opts.compactor = ContextCompactor(soft_threshold=10, hard_threshold=20)
@@ -317,8 +319,13 @@ class TestAgentLoopCompaction:
 
         items = await session_store.load_items(thread_id)
         kinds = [i["kind"] for i in items]
-        # Should have a compaction item
-        assert "compaction" in kinds or len(items) > 2  # compacted or kept
+        # The compactor must have folded the old history into a summary item
+        assert "compaction" in kinds, f"expected a compaction item, got kinds: {kinds}"
+
+        events_list = bus.history(thread_id)
+        assert any(
+            e.get("kind") == "compaction_completed" for e in events_list
+        ), "compaction_completed event should be recorded"
 
 
 class TestAgentLoopToolStorm:
@@ -364,3 +371,51 @@ class TestAgentLoopUsage:
 
         snap = usage.for_thread(thread_id)
         assert snap.get("promptTokens", 0) >= 100
+
+
+class TestAgentLoopUserRoots:
+    """Issue #821: directories the user mentions reach the tool host context."""
+
+    @pytest.mark.asyncio
+    async def test_user_mentioned_roots_reach_tool_context(
+        self,
+        loop_opts: AgentLoopOptions,
+        thread_store: FileThreadStore,
+        turn_svc: TurnService,
+        tmp_path: Path,
+    ) -> None:
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        # The thread workspace is tmp_path/"ws" so the mentioned dir sits
+        # OUTSIDE it — an inside mention would be skipped as already legal.
+        thread = {
+            "id": "th1",
+            "title": "Test Thread",
+            "workspace": str(tmp_path / "ws"),
+            "model": "fake-model",
+            "mode": "agent",
+            "status": "idle",
+            "approvalPolicy": "auto",
+            "sandboxMode": "workspace-write",
+            "relation": "primary",
+            "costBudgetWarningSent": False,
+            "createdAt": FIXED_TIME,
+            "updatedAt": FIXED_TIME,
+            "turns": [],
+        }
+        await thread_store.upsert(thread)
+        result = await turn_svc.start_turn("th1", f"处理 XX，结果输出到 {out_dir}，谢谢")
+        turn_id = result["turnId"]
+
+        loop_opts.model = FakeModelClient(
+            text_chunks=["Let me check..."],
+            tool_calls=[{"id": "call_1", "name": "read", "arguments": {"path": "test.txt"}}],
+        )
+        loop = AgentLoop(loop_opts)
+        status = await loop.run_turn("th1", turn_id)
+        assert status == "completed"
+
+        assert loop_opts.tool_host.calls, "expected at least one tool dispatch"
+        context = loop_opts.tool_host.calls[-1][1]
+        roots = [str(Path(r)) for r in context.user_mentioned_roots]
+        assert str(out_dir.resolve()) in roots

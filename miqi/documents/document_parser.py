@@ -12,9 +12,7 @@ import base64
 import io
 import os
 import re
-import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -39,12 +37,29 @@ MAX_CONTEXT_CHARS = 200_000
 
 # ── Public API ─────────────────────────────────────────────────────────────
 
+# Structured preview caps (issue #877): bound the JSON payload so a giant
+# workbook/document can't blow up the IPC bridge.
+_MAX_STRUCTURED_SHEETS = 8
+_MAX_STRUCTURED_ROWS = 200
+_MAX_STRUCTURED_COLS = 40
+_MAX_STRUCTURED_CELL_CHARS = 500
+_MAX_STRUCTURED_BLOCKS = 300
+_MAX_STRUCTURED_TABLE_ROWS = 100
+_MAX_STRUCTURED_TABLE_COLS = 30
+_MAX_STRUCTURED_IMAGES = 15
+_MAX_STRUCTURED_IMAGE_BYTES = 2 * 1024 * 1024      # per image
+_MAX_STRUCTURED_IMAGE_TOTAL = 8 * 1024 * 1024      # summed across a document
+_MAX_STRUCTURED_BLOCK_TEXT_CHARS = 2000            # per heading/paragraph block
+_MAX_STRUCTURED_TEXT_TOTAL = 100_000               # summed text budget (CWE-400)
+
+
 def parse_document(
     file_path: Path,
     *,
     max_chars: int = MAX_CONTEXT_CHARS,
     force_ocr: bool = False,
     extract_charts: bool = True,
+    structured: bool = False,
 ) -> dict[str, Any]:
     """Parse a document file and return extracted text with metadata.
 
@@ -53,27 +68,33 @@ def parse_document(
         max_chars: Maximum characters to return.
         force_ocr: If True, force OCR even for text-based PDFs.
         extract_charts: If True, also extract structured tables/charts from PDFs/PPTX.
+        structured: If True, also return a `structured` key for formats that
+            support rich in-app rendering (spreadsheets: xlsx/csv; documents:
+            docx).  Used by the frontend preview (issue #877).
 
     Returns:
         dict with keys: text, page_count, size_bytes, mime_type, ocr_used,
-                        parse_ms, charts (if extract_charts=True)
+                        parse_ms, charts (if extract_charts=True),
+                        structured (if structured=True and format supports it)
     """
     suffix = _get_suffix(file_path)
     if suffix in _PDF_SUFFIXES:
         return _parse_pdf(file_path, max_chars=max_chars, force_ocr=force_ocr,
                           extract_charts=extract_charts)
+    elif suffix in _IMAGE_SUFFIXES:
+        return _parse_image(file_path, max_chars=max_chars)
     elif suffix in _DOCX_SUFFIXES:
-        return _parse_docx(file_path, max_chars=max_chars)
+        return _parse_docx(file_path, max_chars=max_chars, structured=structured)
     elif suffix in _PPTX_SUFFIXES:
         return _parse_pptx(file_path, max_chars=max_chars, extract_charts=extract_charts)
     elif suffix in _XLSX_SUFFIXES:
-        return _parse_xlsx(file_path, max_chars=max_chars)
+        return _parse_xlsx(file_path, max_chars=max_chars, structured=structured)
     elif suffix in _MD_SUFFIXES:
         return _parse_markdown(file_path, max_chars=max_chars)
     elif suffix in _HTML_SUFFIXES:
         return _parse_html(file_path, max_chars=max_chars)
     elif suffix in _CSV_SUFFIXES:
-        return _parse_csv(file_path, max_chars=max_chars)
+        return _parse_csv(file_path, max_chars=max_chars, structured=structured)
     elif suffix in _JSON_SUFFIXES:
         return _parse_json(file_path, max_chars=max_chars)
     elif suffix in _XML_FILE_SUFFIXES:
@@ -99,7 +120,7 @@ def parse_document(
     elif suffix in _RTF_SUFFIXES:
         return _parse_rtf(file_path, max_chars=max_chars)
     else:
-        raise ValueError(f"Unsupported document format: {suffix}")
+        raise ValueError(f"不支持的文件格式：{suffix}")
 
 
 def is_supported_document(path: Path | str) -> bool:
@@ -174,6 +195,13 @@ _SH_SUFFIXES = {".sh", ".bash"}
 _TXT_SUFFIXES = {".txt", ".text"}
 _RTF_SUFFIXES = {".rtf"}
 
+_IMAGE_SUFFIXES = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif", ".ico",
+    # SVG 矢量图 — graph_render 产物（#715）：需进 _ALL_DOCUMENT_SUFFIXES
+    # 否则后缀校验在查 MIME 前就拒绝（CodeRabbit #761）
+    ".svg",
+}
+
 _ALL_DOCUMENT_SUFFIXES = (
     _PDF_SUFFIXES | _DOCX_SUFFIXES | _PPTX_SUFFIXES |
     _XLSX_SUFFIXES | _MD_SUFFIXES | _HTML_SUFFIXES |
@@ -181,7 +209,7 @@ _ALL_DOCUMENT_SUFFIXES = (
     _YAML_SUFFIXES | _ENV_SUFFIXES | _LOG_SUFFIXES |
     _SQL_SUFFIXES | _INI_SUFFIXES | _TOML_SUFFIXES |
     _HTACCESS_SUFFIXES | _SH_SUFFIXES | _TXT_SUFFIXES |
-    _RTF_SUFFIXES
+    _RTF_SUFFIXES | _IMAGE_SUFFIXES
 )
 
 
@@ -209,6 +237,16 @@ def _get_suffix(file_path: Path | str) -> str:
 
 _SUFFIX_TO_MIME: dict[str, str] = {
     ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -342,17 +380,78 @@ def _parse_pdf(
 
 
 def _pdf_ocr(file_path: Path) -> str:
-    """OCR a PDF using pdftoppm + tesseract.
+    """OCR a PDF with PyMuPDF + RapidOCR (packaging-friendly, #704).
 
-    Searches for TESSDATA_PREFIX in environment variables first,
-    then common system paths, then ~/.local/share/tessdata.
-    Supports chi_sim+eng language pack (auto-detect Chinese characters).
+    Mirrors RapidAI/RapidOCRPDF's approach: extract the embedded text layer
+    first (digital PDFs need no OCR), then render scanned pages with PyMuPDF
+    and recognize with the same RapidOCR engine used for images — no external
+    pdftoppm/tesseract binaries, so it works in the packaged exe too.
     """
-    import os as _os
+    try:
+        import pymupdf as fitz  # PyMuPDF (new API name; `fitz` is deprecated)
+    except ImportError:
+        logger.warning("PyMuPDF not installed, PDF OCR unavailable")
+        return ""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
 
-    # Resolve tessdata prefix — needed for custom installs where
-    # tesseract lang data is not in the default /usr/share path.
-    _tessdata_prefix = _os.environ.get("TESSDATA_PREFIX", "")
+        engine = RapidOCR()
+    except Exception as exc:
+        logger.warning(f"RapidOCR unavailable for {file_path}: {exc}")
+        return ""
+
+    import numpy as np
+
+    full_text: list[str] = []
+    try:
+        with fitz.open(file_path) as doc:
+            for page in doc:
+                text = page.get_text("text", sort=True)
+                if text.strip():
+                    full_text.append(text.strip())
+                    continue
+                # Scanned page (no text layer) → render + OCR.
+                pix = page.get_pixmap(dpi=200)
+                img = np.frombuffer(pix.samples, dtype=np.uint8)
+                img = img.reshape(pix.h, pix.w, pix.n)
+                try:
+                    result, _ = engine(img)
+                    if result:
+                        lines = [line[1] for line in result if len(line) > 1 and line[1].strip()]
+                        if lines:
+                            full_text.append("\n".join(lines))
+                except Exception as exc:
+                    logger.warning(f"RapidOCR page OCR failed: {exc}")
+    except Exception as exc:
+        logger.error(f"PDF OCR pipeline failed: {exc}")
+        return ""
+    return "\n\n".join(full_text)
+
+
+# ── Images (OCR) ─────────────────────────────────────────────────────────
+
+def _image_ocr(file_path: Path) -> str:
+    """OCR a single image.
+
+    Prefers RapidOCR (pure-Python ONNX runtime, no system binary, strong
+    zh/en accuracy) and falls back to tesseract (chi_sim+eng) when RapidOCR
+    is not installed. Returns "" (never raises) when no engine is available.
+    """
+    # Engine 1: RapidOCR — onnxruntime, no system dependency (#659).
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+
+        _engine = RapidOCR()
+        result, _ = _engine(str(file_path))
+        if result:
+            lines = [line[1] for line in result if len(line) > 1 and line[1].strip()]
+            if lines:
+                return "\n".join(lines)
+    except Exception as exc:
+        logger.warning(f"RapidOCR unavailable for {file_path}: {exc}")
+
+    # Engine 2: tesseract (chi_sim+eng) — needs the system binary.
+    _tessdata_prefix = os.environ.get("TESSDATA_PREFIX", "")
     if not _tessdata_prefix:
         for _candidate in (
             "/usr/share/tesseract-ocr/4.00",
@@ -364,52 +463,56 @@ def _pdf_ocr(file_path: Path) -> str:
                 _tessdata_prefix = _candidate
                 break
 
-    _env = dict(_os.environ)
+    _env = dict(os.environ)
     if _tessdata_prefix:
         _env["TESSDATA_PREFIX"] = _tessdata_prefix
-        logger.info(f"OCR: TESSDATA_PREFIX={_tessdata_prefix}")
 
     try:
-        # Convert PDF pages to images
-        pages_dir = tempfile.mkdtemp(prefix="miqi_ocr_")
-        try:
-            subprocess.run(
-                ["pdftoppm", "-r", "200", "-png", str(file_path), f"{pages_dir}/page"],
-                capture_output=True, timeout=120,
-            )
-
-            page_images = sorted(Path(pages_dir).glob("page-*.png"))
-            if not page_images:
-                logger.warning("pdftoppm produced no images")
-                return ""
-
-            # OCR each page
-            full_text_parts = []
-            for img_path in page_images:
-                try:
-                    result = subprocess.run(
-                        ["tesseract", str(img_path), "stdout", "-l", "chi_sim+eng"],
-                        capture_output=True, text=True, timeout=30,
-                        env=_env,
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        full_text_parts.append(result.stdout.strip())
-                except Exception as exc:
-                    logger.warning(f"Tesseract OCR failed for {img_path}: {exc}")
-
-            return "\n\n".join(full_text_parts)
-        finally:
-            # Guarantee cleanup on every exit path (including no-images + OCR failures)
-            shutil.rmtree(pages_dir, ignore_errors=True)
+        result = subprocess.run(
+            ["tesseract", str(file_path), "stdout", "-l", "chi_sim+eng"],
+            capture_output=True, text=True, timeout=60, env=_env,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
     except FileNotFoundError:
-        logger.warning("pdftoppm or tesseract not found, OCR unavailable")
-        return ""
+        logger.warning("tesseract not found, image OCR unavailable")
     except subprocess.TimeoutExpired:
-        logger.warning("PDF OCR timed out (too many pages or complex layout)")
-        return ""
+        logger.warning("image OCR timed out")
     except Exception as exc:
-        logger.error(f"OCR pipeline failed: {exc}")
-        return ""
+        logger.warning(f"image OCR failed: {exc}")
+    return ""
+
+
+def _parse_image(file_path: Path, max_chars: int = MAX_CONTEXT_CHARS) -> dict[str, Any]:
+    """Parse an image: OCR text (tesseract, chi_sim+eng) + basic metadata.
+
+    Falls back to metadata-only when tesseract is unavailable. The text is
+    prefixed with an image header (size/format) so the model understands it
+    is describing an image.
+    """
+    result: dict[str, Any] = {
+        "text": "", "page_count": 1, "size_bytes": file_path.stat().st_size,
+        "mime_type": _SUFFIX_TO_MIME.get(file_path.suffix.lower(), "image/octet-stream"),
+        "ocr_used": False, "parse_ms": 0, "charts": [],
+    }
+    _t0 = time.time()
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(file_path) as img:
+            width, height = img.size
+            fmt = img.format or ""
+        header = f"[图片] {file_path.name} ({width}x{height}, {fmt})\n"
+        ocr_text = _image_ocr(file_path)
+        if ocr_text:
+            result["ocr_used"] = True
+            result["text"] = (header + ocr_text)[:max_chars]
+        else:
+            result["text"] = (header + "（图片未提取到文字：tesseract 不可用或图中无文字）")[:max_chars]
+        result["parse_ms"] = int((time.time() - _t0) * 1000)
+    except Exception as exc:
+        logger.warning(f"image parse failed for {file_path}: {exc}")
+        result["text"] = (f"[图片] {file_path.name}（解析失败: {exc}）")[:max_chars]
+    return result
 
 
 # ── Chart & Table extraction ────────────────────────────────────────────────
@@ -422,7 +525,7 @@ def _extract_chart_data_from_pdf_page(page_obj: Any) -> list[dict[str, Any]]:
     """
     tables = []
     try:
-        import pdfplumber
+        import pdfplumber  # noqa: F401 (availability probe)
         # pdfplumber works with file paths, not page objects
     except ImportError:
         return tables
@@ -480,7 +583,110 @@ def _format_charts(charts: list[dict[str, Any]]) -> str:
 
 # ── Word (DOCX) Parsing ────────────────────────────────────────────────────
 
-def _parse_docx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS) -> dict[str, Any]:
+_DOCX_HEADING_RE = re.compile(r"(Heading|标题)\s*(\d+)", re.IGNORECASE)
+
+
+def _docx_structured_blocks(doc: Any) -> list[dict[str, Any]]:
+    """Walk a python-docx document body in order and emit render blocks.
+
+    Block kinds (issue #877): heading / paragraph / table / image.  Images are
+    extracted from inline shapes and inlined as base64 data URLs (best-effort;
+    skipped when too large).  Text blocks are individually capped and share an
+    aggregate budget so a hostile/huge document can't blow up the IPC payload
+    (CWE-400, CodeRabbit #889).  Returns [] when the document is too large to
+    render or an unexpected element fails — the caller falls back to text.
+    """
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    blocks: list[dict[str, Any]] = []
+    image_count = 0
+    image_bytes_total = 0
+    text_total = 0
+
+    def add_image(blip: Any) -> None:
+        nonlocal image_count, image_bytes_total
+        if image_count >= _MAX_STRUCTURED_IMAGES or image_bytes_total >= _MAX_STRUCTURED_IMAGE_TOTAL:
+            return
+        rid = blip.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+        )
+        if not rid:
+            return  # linked image — no embedded blob
+        part = doc.part.related_parts.get(rid)
+        if part is None:
+            return
+        try:
+            data = part.blob
+        except Exception:
+            return
+        if not data or len(data) > _MAX_STRUCTURED_IMAGE_BYTES:
+            return
+        if image_bytes_total + len(data) > _MAX_STRUCTURED_IMAGE_TOTAL:
+            return
+        mime = getattr(part, "content_type", "") or "image/png"
+        image_count += 1
+        image_bytes_total += len(data)
+        blocks.append({
+            "type": "image",
+            "data_url": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
+        })
+
+    def add_text(text: str) -> None:
+        nonlocal text_total
+        text_total += len(text)
+
+    try:
+        for child in doc.element.body.iterchildren():
+            if len(blocks) >= _MAX_STRUCTURED_BLOCKS:
+                break
+            if text_total >= _MAX_STRUCTURED_TEXT_TOTAL:
+                break  # aggregate payload budget reached — stop emitting
+            if child.tag == qn("w:p"):
+                para = Paragraph(child, doc)
+                for blip in child.findall(
+                    ".//{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+                ):
+                    add_image(blip)
+                text = para.text[:_MAX_STRUCTURED_BLOCK_TEXT_CHARS]
+                style_name = ""
+                try:
+                    style_name = (para.style.name if para.style else "") or ""
+                except Exception:
+                    style_name = ""
+                heading_match = _DOCX_HEADING_RE.search(style_name)
+                if heading_match and text.strip():
+                    blocks.append({
+                        "type": "heading",
+                        "level": max(1, min(4, int(heading_match.group(2)))),
+                        "text": text,
+                    })
+                    add_text(text)
+                elif text.strip():
+                    blocks.append({"type": "paragraph", "text": text})
+                    add_text(text)
+            elif child.tag == qn("w:tbl"):
+                table = Table(child, doc)
+                rows: list[list[str]] = []
+                for row in table.rows[:_MAX_STRUCTURED_TABLE_ROWS]:
+                    cells = [
+                        cell.text.strip()[:_MAX_STRUCTURED_CELL_CHARS]
+                        for cell in row.cells[:_MAX_STRUCTURED_TABLE_COLS]
+                    ]
+                    rows.append(cells)
+                if rows:
+                    blocks.append({"type": "table", "rows": rows})
+                    add_text("".join("".join(cells) for cells in rows))
+    except Exception as exc:
+        logger.warning("DOCX structured extraction failed: {}", exc)
+        return []
+
+    return blocks
+
+
+def _parse_docx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS,
+                structured: bool = False) -> dict[str, Any]:
     """Extract text from a Word document."""
     import time
     t0 = time.monotonic()
@@ -518,7 +724,7 @@ def _parse_docx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS) -> dict[
     text = text[:max_chars]
     parse_ms = (time.monotonic() - t0) * 1000
 
-    return {
+    result = {
         "text": text,
         "page_count": page_count,
         "size_bytes": file_path.stat().st_size,
@@ -526,6 +732,19 @@ def _parse_docx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS) -> dict[
         "ocr_used": False,
         "parse_ms": round(parse_ms, 0),
     }
+    if structured:
+        # Only .docx supports rich blocks (python-docx can't read .doc/.odt);
+        # failures leave structured unset so the frontend falls back to text.
+        if file_path.suffix.lower() == ".docx" and not text.startswith("[文档解析失败"):
+            try:
+                from docx import Document
+                doc = Document(str(file_path))
+                blocks = _docx_structured_blocks(doc)
+                if blocks:
+                    result["structured"] = {"kind": "document", "blocks": blocks}
+            except Exception as exc:
+                logger.warning("DOCX structured pass failed: {}", exc)
+    return result
 
 
 # ── PowerPoint (PPTX) Parsing ──────────────────────────────────────────────
@@ -635,7 +854,8 @@ def _parse_pptx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS,
 
 # ── Excel (XLSX) Parsing ───────────────────────────────────────────────────
 
-def _parse_xlsx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS) -> dict[str, Any]:
+def _parse_xlsx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS,
+                structured: bool = False) -> dict[str, Any]:
     """Extract text and data from an Excel spreadsheet."""
     import time
     t0 = time.monotonic()
@@ -678,7 +898,7 @@ def _parse_xlsx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS) -> dict[
     text = text[:max_chars]
     parse_ms = (time.monotonic() - t0) * 1000
 
-    return {
+    result = {
         "text": text,
         "page_count": sheet_count,
         "size_bytes": file_path.stat().st_size,
@@ -686,6 +906,43 @@ def _parse_xlsx(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS) -> dict[
         "ocr_used": False,
         "parse_ms": round(parse_ms, 0),
     }
+    if structured:
+        # Only openpyxl-readable workbooks (.xlsx; .xls/.ods raise) get the
+        # rich table payload — failures leave structured unset for the text
+        # fallback.  Non-read-only load so merged-cell ranges are available.
+        if file_path.suffix.lower() == ".xlsx" and not text.startswith("[文档解析失败"):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(str(file_path), data_only=True)
+                sheets: list[dict[str, Any]] = []
+                for ws in wb.worksheets[:_MAX_STRUCTURED_SHEETS]:
+                    max_row = min(ws.max_row or 1, _MAX_STRUCTURED_ROWS)
+                    max_col = min(ws.max_column or 1, _MAX_STRUCTURED_COLS)
+                    rows: list[list[str]] = []
+                    for row in ws.iter_rows(
+                        min_row=1, max_row=max_row, max_col=max_col, values_only=True
+                    ):
+                        rows.append([
+                            "" if cell is None else str(cell)[:_MAX_STRUCTURED_CELL_CHARS]
+                            for cell in row
+                        ])
+                    merges: list[dict[str, int]] = []
+                    for rng in ws.merged_cells.ranges:
+                        if rng.min_row > _MAX_STRUCTURED_ROWS or rng.min_col > _MAX_STRUCTURED_COLS:
+                            continue
+                        merges.append({
+                            "start_row": max(0, rng.min_row - 1),
+                            "start_col": max(0, rng.min_col - 1),
+                            "end_row": min(_MAX_STRUCTURED_ROWS - 1, rng.max_row - 1),
+                            "end_col": min(_MAX_STRUCTURED_COLS - 1, rng.max_col - 1),
+                        })
+                    sheets.append({"name": ws.title, "rows": rows, "merges": merges})
+                wb.close()
+                if sheets:
+                    result["structured"] = {"kind": "spreadsheet", "sheets": sheets}
+            except Exception as exc:
+                logger.warning("XLSX structured pass failed: {}", exc)
+    return result
 
 
 # ── Markdown Parsing ────────────────────────────────────────────────────────
@@ -816,7 +1073,7 @@ def _parse_markdown(file_path: Path, *, max_chars: int = MAX_CONTEXT_CHARS) -> d
 def _parse_html(file_path: Path, max_chars: int = 50000) -> dict:
     """Extract text from HTML files using lxml."""
     if not _HAS_LXML_HTML:
-        raise RuntimeError("lxml is required for HTML parsing")
+        raise RuntimeError("解析 HTML 需要 lxml")
 
     t0 = time.perf_counter()
     raw = file_path.read_text(encoding="utf-8", errors="replace")
@@ -825,7 +1082,6 @@ def _parse_html(file_path: Path, max_chars: int = 50000) -> dict:
         doc = _lxml_html.document_fromstring(raw)
     except Exception:
         # Fallback: plain text stripping via stdlib
-        stem = Path(file_path.stem).stem if file_path.stem else "HTML"
         from html.parser import HTMLParser as _StdlibParser
         class _Stripper(_StdlibParser):
             def __init__(self):
@@ -879,7 +1135,8 @@ def _parse_html(file_path: Path, max_chars: int = 50000) -> dict:
 
 # ── CSV Parser ────────────────────────────────────────────────────────────
 
-def _parse_csv(file_path: Path, max_chars: int = MAX_CONTEXT_CHARS) -> dict[str, Any]:
+def _parse_csv(file_path: Path, max_chars: int = MAX_CONTEXT_CHARS,
+               structured: bool = False) -> dict[str, Any]:
     """Extract and format CSV data as readable text."""
     import csv as _csv_mod
     t0 = time.perf_counter()
@@ -888,7 +1145,13 @@ def _parse_csv(file_path: Path, max_chars: int = MAX_CONTEXT_CHARS) -> dict[str,
         reader = _csv_mod.reader(io.StringIO(raw, newline=""))
         rows = list(reader)
         if not rows:
-            return _make_text_result(file_path, raw, max_chars, t0, "text/csv")
+            result = _make_text_result(file_path, raw, max_chars, t0, "text/csv")
+            if structured:
+                result["structured"] = {
+                    "kind": "spreadsheet",
+                    "sheets": [{"name": file_path.stem or "CSV", "rows": []}],
+                }
+            return result
         # Format as table-like text
         lines = []
         headers = rows[0] if rows else []
@@ -904,7 +1167,19 @@ def _parse_csv(file_path: Path, max_chars: int = MAX_CONTEXT_CHARS) -> dict[str,
         logger.warning(f"CSV parsing failed: {exc}, falling back to raw text")
         raw = file_path.read_text(encoding="utf-8", errors="replace")
         text = raw
-    return _make_text_result(file_path, text, max_chars, t0, "text/csv")
+        rows = []
+    result = _make_text_result(file_path, text, max_chars, t0, "text/csv")
+    if structured:
+        sheet_rows = [
+            [str(cell)[:_MAX_STRUCTURED_CELL_CHARS]
+             for cell in row[:_MAX_STRUCTURED_COLS]]
+            for row in rows[:_MAX_STRUCTURED_ROWS]
+        ]
+        result["structured"] = {
+            "kind": "spreadsheet",
+            "sheets": [{"name": file_path.stem or "CSV", "rows": sheet_rows}],
+        }
+    return result
 
 
 # ── JSON Parser ───────────────────────────────────────────────────────────

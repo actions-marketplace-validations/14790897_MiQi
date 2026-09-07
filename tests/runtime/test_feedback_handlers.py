@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -86,8 +85,8 @@ async def test_feedback_list_returns_entries():
 @pytest.mark.asyncio
 async def test_feedback_list_respects_limit():
     """With 7 backups and limit=3, only the newest 3 are returned."""
-    from miqi.runtime.feedback_handlers import feedback_list_handler
     import miqi.runtime.feedback_handlers as handlers
+    from miqi.runtime.feedback_handlers import feedback_list_handler
 
     workspace = _make_workspace()
     state = _make_mock_state(workspace)
@@ -119,8 +118,8 @@ async def test_feedback_list_respects_limit():
 @pytest.mark.asyncio
 async def test_feedback_list_limit_zero_returns_all():
     """limit=0 (or null/None) means no limit — return everything."""
-    from miqi.runtime.feedback_handlers import feedback_list_handler
     import miqi.runtime.feedback_handlers as handlers
+    from miqi.runtime.feedback_handlers import feedback_list_handler
 
     workspace = _make_workspace()
     state = _make_mock_state(workspace)
@@ -148,8 +147,8 @@ async def test_feedback_list_limit_zero_returns_all():
 @pytest.mark.asyncio
 async def test_feedback_list_limit_clamps_to_max():
     """limit > 200 is clamped to 200 to bound work."""
-    from miqi.runtime.feedback_handlers import feedback_list_handler
     import miqi.runtime.feedback_handlers as handlers
+    from miqi.runtime.feedback_handlers import feedback_list_handler
 
     workspace = _make_workspace()
     state = _make_mock_state(workspace)
@@ -265,7 +264,7 @@ async def test_feedback_submit_rejects_when_disabled(_bridge_state_isolated):
 @pytest.mark.asyncio
 async def test_feedback_submit_rejects_when_no_feishu_credentials(_bridge_state_isolated):
     """feedback:submit raises FEISHU_NOT_CONFIGURED when app_id/app_secret are blank AND schema defaults are overridden to ''."""
-    from miqi.runtime.feedback_handlers import feedback_submit_handler, FeedbackConfig
+    from miqi.runtime.feedback_handlers import FeedbackConfig, feedback_submit_handler
 
     workspace = _make_workspace()
     state = _make_mock_state(workspace, app_id="", app_secret="")
@@ -288,7 +287,7 @@ async def test_feedback_submit_rejects_when_no_feishu_credentials(_bridge_state_
 @pytest.mark.asyncio
 async def test_feedback_submit_rejects_when_no_bitable_config(_bridge_state_isolated):
     """feedback:submit raises BITABLE_NOT_CONFIGURED when bitable target is blank AND schema defaults are overridden to ''."""
-    from miqi.runtime.feedback_handlers import feedback_submit_handler, FeedbackConfig
+    from miqi.runtime.feedback_handlers import FeedbackConfig, feedback_submit_handler
 
     workspace = _make_workspace()
     state = _make_mock_state(workspace, bitable_app_token="", bitable_table_id="")
@@ -363,9 +362,13 @@ def test_collect_all_logs_caps_combined_payload_at_100k_bytes(tmp_path):
     from miqi.runtime.feedback_handlers import _collect_all_logs
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    # Create multiple large files so combined exceeds 196k byte cap
-    for i in range(10):
-        (log_dir / f"log-2026-08-{i:02d}.log").write_text("a" * 100_000, encoding="utf-8")
+    # Create multiple large files so combined exceeds 196k byte cap.  Names use
+    # dates within the 7-day retention window (age > max_age_days is skipped,
+    # so today-7 is the oldest kept date) — the age filter keeps them all.
+    today = date.today()
+    for i in range(8):
+        fdate = today - timedelta(days=i)
+        (log_dir / f"log-{fdate:%Y-%m-%d}.log").write_text("a" * 100_000, encoding="utf-8")
     result = _collect_all_logs(log_dir)
     # Must be at most 196,608 bytes
     assert len(result.encode("utf-8")) <= 196_608, (
@@ -380,23 +383,36 @@ def test_collect_all_logs_byte_cap_handles_multibyte_chars(tmp_path):
     from miqi.runtime.feedback_handlers import _collect_all_logs
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    # Create multiple CJK files so combined exceeds 196k byte cap
-    for i in range(10):
-        (log_dir / f"中-2026-08-{i:02d}.log").write_text("中" * 50_000, encoding="utf-8")
+    # Create multiple CJK files so combined exceeds 196k byte cap.  Names use
+    # dates within the 7-day retention window (age > max_age_days is skipped,
+    # so today-7 is the oldest kept date) — the age filter keeps them all.
+    today = date.today()
+    for i in range(8):
+        fdate = today - timedelta(days=i)
+        (log_dir / f"中-{fdate:%Y-%m-%d}.log").write_text("中" * 50_000, encoding="utf-8")
     result = _collect_all_logs(log_dir)
     assert len(result.encode("utf-8")) <= 196_608
+    # The combined payload must have actually hit the cap
+    assert "截断" in result
 
 
-def test_collect_all_logs_byte_cap_exact_100k_bytes(tmp_path):
-    """Edge case: payload just over 196,608 bytes should be trimmed to fit."""
+def test_collect_all_logs_byte_cap_100k_files_trimmed(tmp_path):
+    """Edge case: 100k-byte files pushing the payload just over 196,608 bytes
+    should be trimmed to fit."""
     from miqi.runtime.feedback_handlers import _collect_all_logs
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    # Create multiple files so combined exceeds the cap
-    for i in range(10):
-        (log_dir / f"edge-2026-08-{i:02d}.log").write_text("x" * 50_000, encoding="utf-8")
+    # Create multiple files so combined exceeds the cap.  Names use dates
+    # within the 7-day retention window (age > max_age_days is skipped,
+    # so today-7 is the oldest kept date) — the age filter keeps them all.
+    today = date.today()
+    for i in range(8):
+        fdate = today - timedelta(days=i)
+        (log_dir / f"edge-{fdate:%Y-%m-%d}.log").write_text("x" * 50_000, encoding="utf-8")
     result = _collect_all_logs(log_dir)
     assert len(result.encode("utf-8")) <= 196_608
+    # The combined payload must have actually hit the cap
+    assert "截断" in result
 
 
 def test_collect_system_info():
@@ -512,6 +528,7 @@ def test_backward_compat_aliases_exist(tmp_path):
 def test_decode_data_url_extracts_mime_filename_and_bytes():
     """Round-trip: build a tiny PNG data URL, decode it."""
     import base64
+
     from miqi.runtime.feedback_handlers import _decode_data_url
 
     # 1x1 transparent PNG
@@ -546,8 +563,9 @@ async def test_feedback_submit_uploads_screenshots_and_creates_record(
     _bridge_state_isolated,
 ):
     """Submit with one screenshot: upload should be called once, record includes 附件 field."""
-    from miqi.runtime.feedback_handlers import feedback_submit_handler
     import base64
+
+    from miqi.runtime.feedback_handlers import feedback_submit_handler
 
     workspace = _make_workspace()
     state = _make_mock_state(workspace)
@@ -687,8 +705,9 @@ async def test_feedback_submit_rejects_oversized_encoded_data_url(_bridge_state_
 @pytest.mark.asyncio
 async def test_feedback_submit_caps_screenshots_at_5(_bridge_state_isolated):
     """More than 5 screenshots → only first 5 are uploaded."""
-    from miqi.runtime.feedback_handlers import feedback_submit_handler
     import base64
+
+    from miqi.runtime.feedback_handlers import feedback_submit_handler
 
     workspace = _make_workspace()
     state = _make_mock_state(workspace)

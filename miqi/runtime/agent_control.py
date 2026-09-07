@@ -6,8 +6,6 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-
-from miqi.runtime.workspace_logging import append_workspace_log
 from typing import Any, Awaitable, Callable
 
 from loguru import logger
@@ -18,20 +16,21 @@ from miqi.execution.hook_runtime import (
     LifecycleHookContext,
 )
 from miqi.protocol.events import (
-    AgentStatus,
-    SubAgentSpawnedEvent,
-    SubAgentCompletedEvent,
-    TurnStartedEvent,
-    TurnCompleteEvent,
-    ToolCallBeginEvent,
-    ToolCallEndEvent,
     AgentMessageEvent,
+    AgentStatus,
     ErrorEvent,
     EventSeverity,
+    SubAgentCompletedEvent,
+    SubAgentSpawnedEvent,
+    ToolCallBeginEvent,
+    ToolCallEndEvent,
+    TurnCompleteEvent,
+    TurnStartedEvent,
 )
 from miqi.runtime.agent_graph_store import AgentGraphStore
 from miqi.runtime.agent_registry import AgentMetadata, AgentRegistry
 from miqi.runtime.agent_status import AgentStateMachine
+from miqi.runtime.workspace_logging import append_workspace_log
 from miqi.utils.tool_text_guard import (
     LEAK_NOTICE,
     sanitize_tool_call_text,
@@ -61,6 +60,30 @@ class LiveAgent:
     completion_emitted: bool = False
 
 
+def build_session_context(
+    workspace: Path,
+    session_id: str,
+    sandbox_manager: Any = None,
+) -> str:
+    """Per-turn session context injected into the agent system prompt.
+
+    Describes the working directory and the ACTUAL exec environment
+    (sandbox active or direct host execution) so the AI issues paths and
+    shell syntax that match reality instead of a hard-coded sandbox story.
+    """
+    from miqi.sandbox.manager import describe_exec_environment
+
+    exec_env = describe_exec_environment(sandbox_manager, workspace=workspace)
+    return (
+        f"\n\n## 工作目录\n"
+        f"你当前的工作目录是: {workspace}\n"
+        f"文件工具（read_file / write_file / list_dir）在这个目录下进行。\n"
+        f"注意：{exec_env}\n"
+        f"当用户问你工作目录时，请直接回答 {workspace}，不要说 /home/miqi/workspace。\n"
+        f"MIQI_SESSION_KEY={session_id}"
+    )
+
+
 class AgentControl:
     """Control plane for multi-agent operations.
 
@@ -84,6 +107,7 @@ class AgentControl:
         store: AgentGraphStore | None = None,
         completion_callback: Callable[[dict], Awaitable[None]] | None = None,
         max_concurrent: int = 3,
+        sandbox_manager: Any = None,  # live sandbox state for prompt context
     ):
         self.session_id = session_id
         self.registry = registry
@@ -96,6 +120,7 @@ class AgentControl:
         self._hooks = hooks
         self._store = store
         self._completion_callback = completion_callback
+        self._sandbox_manager = sandbox_manager
         # Issue #246: cap concurrently-running subagents (default 3, the
         # legacy SubagentManager limit).  Terminal agents (completed/error/
         # aborted) do not count; killed agents are removed from the registry.
@@ -465,9 +490,9 @@ class AgentControl:
         role-filtered tool definitions based on their agent type.
         Results, errors, and messages are persisted on LiveAgent.
         """
-        import uuid as _uuid
-        import time as _time
         import json
+        import time as _time
+        import uuid as _uuid
 
         turn_id = str(_uuid.uuid4())[:12]
         tools_used: list[str] = []
@@ -486,16 +511,10 @@ class AgentControl:
             if agent.state.current != AgentStatus.THINKING:
                 agent.state.transition(AgentStatus.THINKING)
             # Inject session workspace info so the AI knows where its files live
-            _sess_key = "".join(
-                c if c.isalnum() or c in "_-" else "_"
-                for c in self.session_id.split(":", 1)[-1]
-            )
-            _session_context = (
-                f"\n\n## 工作目录\n"
-                f"你当前的工作目录是: {self.workspace}\n"
-                f"所有文件操作（read_file / write_file / list_dir / exec）都在这个目录下进行。\n"
-                f"当用户问你工作目录时，请直接回答 {self.workspace}，不要说 /home/miqi/workspace。\n"
-                f"MIQI_SESSION_KEY={self.session_id}"
+            _session_context = build_session_context(
+                workspace=self.workspace,
+                session_id=self.session_id,
+                sandbox_manager=self._sandbox_manager,
             )
             agent.messages = [
                 {"role": "system", "content": agent.metadata.system_prompt + _session_context},
@@ -589,6 +608,19 @@ class AgentControl:
                             client_id=turn_ctx.client_id,
                             session_id=turn_ctx.session_id,
                         )
+                        # #821: sub-agents inherit the parent task's
+                        # user-mentioned output dirs (the spawn prompt usually
+                        # echoes them).
+                        try:
+                            from miqi.agent.tools.user_roots import extract_user_mentioned_roots
+
+                            ctx.user_mentioned_roots = [
+                                str(r) for r in extract_user_mentioned_roots(
+                                    [task], workspace=self.workspace,
+                                )
+                            ]
+                        except Exception:
+                            ctx.user_mentioned_roots = []
                         ctx = await self._orchestrator.execute(ctx)
                         result = ctx.result or ""
                         success = ctx.status == OrchestrationResult.SUCCESS

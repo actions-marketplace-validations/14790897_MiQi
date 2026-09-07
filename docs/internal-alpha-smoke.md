@@ -1,4 +1,4 @@
-# MiQi Desktop Internal Alpha Smoke Checklist
+# MiQroForge Desktop Internal Alpha Smoke Checklist
 
 Run this checklist before sharing an internal alpha build.
 

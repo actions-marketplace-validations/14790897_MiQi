@@ -6,10 +6,10 @@ typed protocol events onto the shared event queue.
 
 from __future__ import annotations
 
-import dataclasses
-import uuid
 import asyncio
+import dataclasses
 import inspect
+import uuid
 from typing import Any
 
 from loguru import logger
@@ -37,6 +37,30 @@ from miqi.protocol.events import (
     TurnCompleteEvent,
     TurnStartedEvent,
 )
+
+# System-prompt prefix per agent execution mode (plan/manual/edit/auto).
+_MODE_PROMPTS = {
+    "plan": (
+        "【Agent 模式：规划 — 只读分析】你的角色是分析助手。"
+        "你可以使用只读工具（搜索、读文件、查看代码）获取信息、分析问题、提供方案和建议。\n"
+        "限制：不能修改文件，不能执行会改变环境的命令，不能创建或删除资源。\n"
+        "请在回答中充分利用搜索、阅读等只读工具来获取信息并给出分析。"
+        "如果用户请求修改，请描述修改方案和步骤，"
+        "等待用户切换到「允许编辑」或「自动」模式后再执行。\n\n"
+    ),
+    "manual": (
+        "【Agent 模式：手动】你的角色是协作者。你有全部工具，但每个操作需要用户确认。"
+        "请逐步说明你打算做什么（改哪个文件、执行什么命令），等待用户逐一批准后再动手。\n\n"
+    ),
+    "edit": (
+        "【Agent 模式：允许编辑】你的角色是工程师。直接修改文件，安全操作自动放行。"
+        "危险操作（执行命令、网络请求、删除文件）需要用户确认。高效工作。\n\n"
+    ),
+    "auto": (
+        "【Agent 模式：自动】你的角色是全权代理。完全自主执行，不中断询问。"
+        "直接完成任务，注意安全底线。用户信任你的判断。\n\n"
+    ),
+}
 
 
 def _classify_chain(exc: BaseException):
@@ -96,7 +120,7 @@ class TaskRunner:
             if ":" not in session_id:
                 return  # Unknown format — skip
             client_id, session_key = session_id.split(":", 1)
-            workspace = getattr(self.services, "workspace", None)
+            workspace = self.services.workspace
             if workspace is None:
                 return
             from miqi.session.manager import SessionManager
@@ -170,7 +194,7 @@ class TaskRunner:
             # Phase 31.4: cancel any pending approvals for this thread
             # so waiting tool calls are unblocked and no orphan approvals
             # remain in the pending set.
-            orchestrator = getattr(self.services, "orchestrator", None)
+            orchestrator = self.services.orchestrator
             cancel_fn = getattr(orchestrator, "cancel_approvals_for_thread", None)
             if callable(cancel_fn) and inspect.iscoroutinefunction(cancel_fn):
                 await cancel_fn(thread_id, reason="Turn aborted by user.")
@@ -184,7 +208,7 @@ class TaskRunner:
             return
         if isinstance(submission, ApprovalResponse):
             # Phase 18: resolve orchestrator approval
-            orchestrator = getattr(self.services, "orchestrator", None)
+            orchestrator = self.services.orchestrator
             if orchestrator is None or not hasattr(orchestrator, "resolve_approval"):
                 await self._events.put(CommandRejectedEvent(
                     command_type="ApprovalResponse",
@@ -218,7 +242,7 @@ class TaskRunner:
         if isinstance(submission, ConfigUpdate):
             # Phase 18: mutate session state and emit ConfigUpdatedEvent.
             # All failure paths must emit CommandRejectedEvent, never crash.
-            state = getattr(self.services, "session_state", None)
+            state = self.services.session_state
             if state is None or not hasattr(state, "apply_config_update"):
                 await self._events.put(CommandRejectedEvent(
                     command_type="ConfigUpdate",
@@ -242,8 +266,8 @@ class TaskRunner:
             return
         if isinstance(submission, CompactCommand):
             # Phase 19: trigger context compaction via ContextRuntime
-            ctx_runtime = getattr(self.services, "context_runtime", None)
-            history_runtime = getattr(self.services, "history_runtime", None)
+            ctx_runtime = self.services.context_runtime
+            history_runtime = self.services.history_runtime
             if ctx_runtime is None or history_runtime is None:
                 await self._events.put(CommandRejectedEvent(
                     command_type="CompactCommand",
@@ -257,7 +281,7 @@ class TaskRunner:
                     history_runtime=history_runtime,
                     thread_id=submission.thread_id,
                     turn_id=compact_turn_id,
-                    model=getattr(self.services.model_settings, "model", "default"),
+                    model=self.services.model_settings.model,
                 )
             except Exception as exc:
                 await self._events.put(CommandRejectedEvent(
@@ -312,12 +336,13 @@ class TaskRunner:
             return
 
         from types import SimpleNamespace
+
         from miqi.runtime.agent_registry import AgentRegistry
         from miqi.runtime.permission_profile import PermissionProfile
         from miqi.runtime.turn_context import TurnContext
 
         metadata = AgentRegistry().resolve("main")
-        session_id = getattr(self.services, "session_id", "")
+        session_id = self.services.session_id
         client_id = session_id.split(":")[0] if ":" in session_id else ""
         turn = TurnContext(
             turn_id=turn_id,
@@ -338,7 +363,7 @@ class TaskRunner:
         if cancel_evt is not None:
             turn.cancel_event = cancel_evt
 
-        ledger = getattr(self.services, "ledger_runtime", None)
+        ledger = self.services.ledger_runtime
 
         try:
             if cmd.standalone:
@@ -366,7 +391,7 @@ class TaskRunner:
                     "_exec_source": "userShell",
                 },
             )
-            tool_runtime = getattr(self.services, "tool_runtime", None)
+            tool_runtime = self.services.tool_runtime
             if tool_runtime is None:
                 err_msg = "Runtime has no tool runtime"
                 if cmd.standalone:
@@ -456,9 +481,12 @@ class TaskRunner:
 
         # Phase 14 follow-up: register a cancel event so AbortTurn can
         # signal this specific turn to stop. Reuse existing event if a
-        # previous turn on the same thread hasn't been cleaned up yet.
+        # previous turn on the same thread hasn't been cleaned up yet — but
+        # NOT if it's already set, or a fresh user message right after an
+        # abort would inherit the previous turn's cancellation and die
+        # "before start" (#542).
         cancel_evt = self._turn_cancel_events.get(thread_id)
-        if cancel_evt is None:
+        if cancel_evt is None or cancel_evt.is_set():
             cancel_evt = asyncio.Event()
             self._turn_cancel_events[thread_id] = cancel_evt
 
@@ -468,9 +496,9 @@ class TaskRunner:
         self._turn_steer_queues[turn_id] = steer_queue
 
         # Phase 17: get history runtime for persistence and loading
-        history_runtime = getattr(self.services, "history_runtime", None)
+        history_runtime = self.services.history_runtime
         # Phase 24: get ledger runtime for append-only event recording
-        ledger = getattr(self.services, "ledger_runtime", None)
+        ledger = self.services.ledger_runtime
 
         # Build TurnContext and run through TurnRunner (Phase 12)
         from miqi.runtime.agent_registry import AgentRegistry
@@ -480,7 +508,7 @@ class TaskRunner:
         # Phase 31.4: extract client_id from session_id (format: client_id:session_key).
         # This is a best-effort derivation; a dedicated client_id field on
         # RuntimeServices would be a future improvement.
-        session_id = getattr(self.services, "session_id", "")
+        session_id = self.services.session_id
         client_id = session_id.split(":")[0] if ":" in session_id else ""
         turn = TurnContext(
             turn_id=turn_id,
@@ -490,15 +518,20 @@ class TaskRunner:
             model=self.services.model_settings.model,
             provider=self.services.provider,
             execution_policy=msg.mode or "edit",
+            reasoning_mode=getattr(msg, "reasoning_mode", None),
             temperature=self.services.model_settings.temperature,
             max_tokens=self.services.model_settings.max_tokens,
             client_id=client_id,
             session_id=session_id,
         )
+        # #680: fast caps the generation budget (2048) so answers land in the
+        # 30s window; think keeps the full budget (desktop chain).
+        if getattr(msg, "reasoning_mode", None) == "fast":
+            turn.max_tokens = 2048
 
         # Phase 13: resolve capabilities and permission profile
         tools: list[dict[str, Any]] = []
-        capability_resolver = getattr(self.services, "capability_resolver", None)
+        capability_resolver = self.services.capability_resolver
         if capability_resolver is not None:
             capabilities = capability_resolver.resolve(agent_metadata=metadata)
             turn.capabilities = capabilities
@@ -532,30 +565,46 @@ class TaskRunner:
             turn.force_approval = True
         # edit: both flags False → normal approval flow
 
-        _MODE_PROMPTS = {
-            "plan": (
-                "【Agent 模式：规划 — 只读分析】你的角色是分析助手。"
-                "你可以使用只读工具（搜索、读文件、查看代码）获取信息、分析问题、提供方案和建议。\n"
-                "限制：不能修改文件，不能执行会改变环境的命令，不能创建或删除资源。\n"
-                "请在回答中充分利用搜索、阅读等只读工具来获取信息并给出分析。"
-                "如果用户请求修改，请描述修改方案和步骤，"
-                "等待用户切换到「允许编辑」或「自动」模式后再执行。\n\n"
-            ),
-            "manual": (
-                "【Agent 模式：手动】你的角色是协作者。你有全部工具，但每个操作需要用户确认。"
-                "请逐步说明你打算做什么（改哪个文件、执行什么命令），等待用户逐一批准后再动手。\n\n"
-            ),
-            "edit": (
-                "【Agent 模式：允许编辑】你的角色是工程师。直接修改文件，安全操作自动放行。"
-                "危险操作（执行命令、网络请求、删除文件）需要用户确认。高效工作。\n\n"
-            ),
-            "auto": (
-                "【Agent 模式：自动】你的角色是全权代理。完全自主执行，不中断询问。"
-                "直接完成任务，注意安全底线。用户信任你的判断。\n\n"
-            ),
-        }
         mode_prompt = _MODE_PROMPTS.get(turn.execution_policy, "")
         effective_system_prompt = mode_prompt + metadata.system_prompt if mode_prompt else metadata.system_prompt
+        # #680: reasoning mode (fast/think) — generation budget + prompt.
+        # fast = answer-oriented (short tokens, answer-first prompt); think =
+        # deep research (full budget, depth prompt).  Applied on the DESKTOP
+        # chain (外部审阅 2026-08-24: previously KUN-only, desktop ignored it).
+        reasoning_mode = getattr(turn, "reasoning_mode", None) or ""
+        if reasoning_mode == "fast":
+            from miqi.agent.agent_mode import FAST_PROMPT
+            effective_system_prompt += f"\n\n{FAST_PROMPT}"
+        elif reasoning_mode == "think":
+            from miqi.agent.agent_mode import THINK_PROMPT
+            effective_system_prompt += f"\n\n{THINK_PROMPT}"
+        # 思考过程（reasoning_content）直接用中文展示，用户要求（#539 UI 反馈）。
+        # 结构化思考：分层展开（理解需求→拆解→候选→计划），带编号/圆点列表，
+        # 让思考过程像 DeepSeek Chat 一样清晰成规模。
+        effective_system_prompt += (
+            "\n\n请始终使用中文进行思考和回复。"
+            "思考过程必须使用清晰的结构化格式：每个阶段用 1、2、3… 编号，"
+            "每个要点用 - 圆点列表展开，不要大段连续文字。参考结构：\n"
+            "1. 理解需求：…（要点用圆点列出）\n"
+            "2. 拆解问题：…\n"
+            "3. 候选方案：…（对比用圆点）\n"
+            "4. 执行计划：…（步骤用编号）\n"
+            "网络搜索时：优先用 web_search 获取结果列表，仅抓取与问题直接相关的"
+            "具体文章页面，不要批量抓取 RSS 聚合源或新闻站点首页。"
+        )
+
+        # ask_user_confirm_card usage guidance (issue #646, 功能描述④) —
+        # mirrors the KUN loop injection: when the tool is exposed to the
+        # model, the prompt must tell it WHEN to call it.
+        if any(
+            (t.get("function", {}) or {}).get("name") == "ask_user_confirm_card"
+            or t.get("name") == "ask_user_confirm_card"
+            for t in tools
+            if isinstance(t, dict)
+        ):
+            from miqi.agent.tools.ask_user_confirm import ASK_USER_CONFIRM_INSTRUCTION
+
+            effective_system_prompt += "\n\n" + ASK_USER_CONFIRM_INSTRUCTION
 
         # ── Inject session workspace into the prompt ─────────────────────
         # The AI must know its working directory without needing `pwd`.
@@ -563,15 +612,81 @@ class TaskRunner:
         # (/home/miqi/workspace), which hides the user's chosen project
         # directory. State it explicitly so the AI reports the real
         # workspace (mirrors agent_control's subagent prompt).
-        _ws = getattr(self.services, "workspace", None)
+        # The exec environment sentence reflects the LIVE sandbox state —
+        # with the sandbox off, exec runs directly on the host and the AI
+        # must not be told the WSL /mnt/c story.
+        _ws = self.services.workspace
         if _ws is not None:
+            from miqi.sandbox.manager import describe_exec_environment
+
+            _exec_env = describe_exec_environment(
+                getattr(self.services, "sandbox_manager", None),
+                workspace=_ws,
+            )
             effective_system_prompt = (
                 effective_system_prompt
                 + f"\n\n## 工作目录\n"
                 f"你当前的工作目录是: {_ws}\n"
-                f"所有文件操作（read_file / write_file / list_dir / exec）都在这个目录下进行。\n"
+                f"文件工具（read_file / write_file / list_dir）在这个目录下进行。\n"
+                f"注意：{_exec_env}\n"
                 f"当用户问你工作目录时，请直接回答 {_ws}，不要说 /home/miqi/workspace。\n"
             )
+
+        # ── Local skills injection (skills 精确调用评估的修复) ─────────
+        # agent_registry 主提示词规则 7 要求 agent 先查 "Local Skills" 列表，
+        # 但该列表此前从未注入，导致 agent 唯一的发现途径是 skill_manage(list)
+        # （量化评估: 14 条直接提示词 11 条零技能接触）。这里按渐进披露注入
+        # Layer 1（名称+描述+位置），技能正文仍由 agent 按需加载。
+        if _ws is not None:
+            try:
+                from miqi.agent.skills import SkillsLoader
+
+                _skills_summary = SkillsLoader(_ws).build_skills_summary(
+                    description_max_chars=160,
+                )
+            except Exception:
+                _skills_summary = None
+            if _skills_summary:
+                # 信息层面，强制先 skill_manage(list) 与下方注入的清单是冗余的：
+                # <skills> 已含全部技能名称+描述+位置，list 返回同一份内容。
+                # 仍强制先 list 是行为机制而非信息需求——评估（14 条语料）显示，
+                # 仅注入清单时模型常直接跳过清单调内置工具（召回率 78.6%）；
+                # 强制先 list 后模型必须逐条处理技能目录（注意力锚定 + 结果近因 +
+                # 动作承诺），召回率 92.9%。代价是每回合多一次工具往返 +
+                # list 输出 ~8-10K tokens 再次进入上下文。若未来要省这笔成本，
+                # 可改为 TaskRunner 确定性预匹配：命中即自动注入技能全文，
+                # 不再依赖模型自觉。
+                effective_system_prompt += (
+                    "\n\n## 本地技能清单（Local Skills）\n"
+                    "以下技能是完成任务的标准流程（渐进披露第一层，只预载名称、描述和位置）。\n"
+                    "【强制规则】处理用户请求时（纯寒暄/聊天除外），第一步必须先调用 "
+                    "`skill_manage(action='list')` 获取全部可用技能及其描述；当请求与某个技能的 "
+                    "description 匹配时，接着用 `skill_manage(action='view', name=<技能名>)`"
+                    "（或 read_file 读取 <location> 指向的 SKILL.md）加载该技能全文，然后严格按其"
+                    "说明执行——即使存在看似等价的内置工具（如 create_pptx / create_docx / "
+                    "create_xlsx / create_pdf），也要优先走技能，技能正文会指明用哪个工具执行。\n"
+                    "典型映射：做PPT→pptx-generator；写Word文档/周报→docx；做表格/Excel→xlsx；"
+                    "生成PDF→pdf；查天气→weather；定时提醒→cron；搜/读论文→paper-research；"
+                    "GitHub操作→github；总结要点→summarize；整理工作区→workspace-cleanup；"
+                    "创建新技能→skill-creator。\n"
+                    "`available=\"false\"` 的技能缺少依赖，需要先安装依赖。\n\n"
+                    f"{_skills_summary}"
+                )
+                logger.info(
+                    "skills injection: {} chars into system prompt (turn {})",
+                    len(_skills_summary), turn_id,
+                )
+
+        # ── Search-first strategy (DeepSeek Flash style, #639) ─────────
+        # 用户要求：搜索资料比模型自身知识更重要——回答前默认先搜索；
+        # 思考中记录搜索动作，让用户看到搜索轨迹。
+        effective_system_prompt += (
+            "\n\n## 搜索优先\n"
+            "回答用户问题前，默认先使用 web_search 搜索相关关键词（除非是纯逻辑、"
+            "常识或模型内部确定的内容）。引用事实、时事、数据时必须以搜索结果为依据。"
+            "搜索时在思考过程中记录动作，例如「搜索到 X 个结果」「浏览 Y 个页面」，"
+            "让用户看到你的搜索轨迹。"
+        )
 
         # ── Slash command injection (KWP / Cowork convention) ───────────
         # Detect /-prefixed user input, look up the command body in the
@@ -579,7 +694,7 @@ class TaskRunner:
         # The user-visible content is stripped of the /cmd prefix.
         slash_content: str | None = None
         if msg.content and msg.content.startswith("/"):
-            pm = getattr(self.services, "plugin_manager", None)
+            pm = self.services.plugin_manager
             if pm is not None and hasattr(pm, "get_slash_command"):
                 parts = msg.content[1:].split(None, 1)
                 # Allow namespacing: "/product-management:brainstorm"
@@ -610,6 +725,48 @@ class TaskRunner:
                 + slash_content
             )
 
+        # ── #740: resume context — continue an interrupted turn ──────
+        # Replan (not replay): feed the snapshot's half-generated content to
+        # the model as context and instruct it to continue from where it
+        # stopped, rather than restoring raw messages.
+        resume_turn_id = getattr(msg, "resume_turn_id", None)
+        resume_snapshot: dict[str, Any] | None = None
+        if resume_turn_id and history_runtime is not None:
+            try:
+                resume_snapshot = await history_runtime.get_snapshot(resume_turn_id)
+            except Exception as exc:
+                logger.warning("resume: snapshot lookup failed for {}: {}", resume_turn_id, exc)
+            # Scope/state validation: only resume a snapshot that belongs to
+            # THIS thread and is in a recoverable state — otherwise a request
+            # could inject another thread's partial response into this turn.
+            if resume_snapshot and (
+                resume_snapshot.get("thread_id") != thread_id
+                or resume_snapshot.get("status") not in ("running", "interrupted")
+            ):
+                logger.warning(
+                    "resume: snapshot {} rejected (thread={} status={})",
+                    resume_turn_id, resume_snapshot.get("thread_id"), resume_snapshot.get("status"),
+                )
+                resume_snapshot = None
+                resume_turn_id = None
+            if resume_snapshot and (
+                resume_snapshot.get("assistant_content") or resume_snapshot.get("reasoning_content")
+            ):
+                _half = resume_snapshot["assistant_content"][-2000:]
+                _half_think = resume_snapshot["reasoning_content"][-800:]
+                effective_system_prompt += (
+                    "\n\n## 任务恢复（Resume）\n"
+                    "你正在继续一个被中断的任务。以下是你上次已生成的内容，"
+                    "请从上次中断处继续完成，不要重复已生成的部分。\n\n"
+                    f"已生成回答（末尾部分）:\n{_half or '（尚未生成正文）'}\n\n"
+                    + (f"上次思考过程（末尾部分）:\n{_half_think}\n\n" if _half_think else "")
+                    + "请继续完成该任务。"
+                )
+                logger.info("resume: turn {} injected snapshot context", resume_turn_id)
+            else:
+                logger.warning("resume: no usable snapshot for {}", resume_turn_id)
+                resume_turn_id = None
+
         # ── End Execution Policy ─────────────────────────────────────
 
         # Phase 13: attach permission profile for orchestrator
@@ -636,8 +793,8 @@ class TaskRunner:
                 )
 
             # Phase 19: auto-compact before turn if history exceeds budget
-            ctx_runtime = getattr(self.services, "context_runtime", None)
-            auto_limit = getattr(self.services.model_settings, "context_limit_chars", 0)
+            ctx_runtime = self.services.context_runtime
+            auto_limit = self.services.model_settings.context_limit_chars
             if history_runtime is not None and ctx_runtime is not None and auto_limit:
                 token_limit = max(1, int(int(auto_limit) / 2.5))
                 if ctx_runtime.should_auto_compact(history, token_limit):
@@ -682,36 +839,39 @@ class TaskRunner:
             ))
 
             # Persist the user message
-            payload_fields: dict[str, Any] = {}
-            if msg.input_items:
-                payload_fields["input_items"] = msg.input_items
-            if msg.client_user_message_id:
-                payload_fields["client_user_message_id"] = msg.client_user_message_id
-            # Issue #402: write JSONL FIRST so sessions.get (which reads
-            # JSONL) sees the message even if a crash occurs before the
-            # SQLite write completes.  The JSONL store is the legacy
-            # single-source-of-truth for session overview; SQLite is
-            # thread-scoped and recoverable from JSONL if needed.
-            await self._save_to_session_manager(
-                role="user", content=msg.content)
-            if history_runtime is not None:
-                await history_runtime.append_message(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    role="user",
-                    content=msg.content,
-                    payload={"message_fields": payload_fields},
-                )
-            # Phase 24: record user message in ledger
-            if ledger is not None:
-                await ledger.append_item(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    item_type="message",
-                    role="user",
-                    content=msg.content,
-                    payload={"message_fields": payload_fields},
-                )
+            # #740: resume turns carry no real user input (content is a
+            # placeholder) — skip persisting it so history stays clean.
+            if not resume_turn_id:
+                payload_fields: dict[str, Any] = {}
+                if msg.input_items:
+                    payload_fields["input_items"] = msg.input_items
+                if msg.client_user_message_id:
+                    payload_fields["client_user_message_id"] = msg.client_user_message_id
+                # Issue #402: write JSONL FIRST so sessions.get (which reads
+                # JSONL) sees the message even if a crash occurs before the
+                # SQLite write completes.  The JSONL store is the legacy
+                # single-source-of-truth for session overview; SQLite is
+                # thread-scoped and recoverable from JSONL if needed.
+                await self._save_to_session_manager(
+                    role="user", content=msg.content)
+                if history_runtime is not None:
+                    await history_runtime.append_message(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        role="user",
+                        content=msg.content,
+                        payload={"message_fields": payload_fields},
+                    )
+                # Phase 24: record user message in ledger
+                if ledger is not None:
+                    await ledger.append_item(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        item_type="message",
+                        role="user",
+                        content=msg.content,
+                        payload={"message_fields": payload_fields},
+                    )
 
             # Check for abort before starting turn
             if cancel_evt.is_set():
@@ -736,15 +896,28 @@ class TaskRunner:
                 ))
                 return
 
-            result = await self.services.turn_runner.run(
-                turn=turn,
-                user_content=msg.content,
-                system_prompt=effective_system_prompt,
-                tools=tools,
-                history=history,
-                cancel_event=cancel_evt,
-                steer_queue=steer_queue,
+            # Publish the turn identity for the user-input resolver: the
+            # model's tool args carry no thread/turn ids, and without them
+            # remember scoping + turn cancellation silently break
+            # (issue #646 / CodeRabbit #711).
+            from miqi.agent.user_input_resolver import (
+                clear_thread_context,
+                set_thread_context,
             )
+
+            set_thread_context(thread_id, turn_id)
+            try:
+                result = await self.services.turn_runner.run(
+                    turn=turn,
+                    user_content=msg.content,
+                    system_prompt=effective_system_prompt,
+                    tools=tools,
+                    history=history,
+                    cancel_event=cancel_evt,
+                    steer_queue=steer_queue,
+                )
+            finally:
+                clear_thread_context()
 
             # Persist assistant messages to all stores in a single pass.
             # Build the extra-fields mapping once per message so every
@@ -788,6 +961,10 @@ class TaskRunner:
                     tools_used=result.tools_used,
                     token_usage=result.token_usage,
                 )
+            # #740: resume succeeded — the old interrupted turn's snapshot is
+            # no longer needed (its content is now part of this turn's reply).
+            if resume_turn_id and history_runtime is not None:
+                await history_runtime.delete_snapshot(resume_turn_id)
             # Phase 24: complete turn in ledger
             if ledger is not None:
                 await ledger.append_item(
@@ -810,6 +987,8 @@ class TaskRunner:
                 content=result.final_content or "",
                 finish_reason="stop",
                 tool_calls=tool_calls,
+                reasoning=result.reasoning,
+                reasoning_elapsed_s=result.reasoning_elapsed_s,
             ))
             await self._events.put(TurnCompleteEvent(
                 turn_id=turn_id,
@@ -947,7 +1126,7 @@ class TaskRunner:
             ThreadUpdatedEvent,
         )
 
-        threads = getattr(self.services, "thread_runtime", None)
+        threads = self.services.thread_runtime
         if threads is None:
             await self._events.put(CommandRejectedEvent(
                 command_type="ThreadCommand",

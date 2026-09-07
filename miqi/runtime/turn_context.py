@@ -10,8 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from miqi.runtime.agent_registry import AgentMetadata
 from miqi.protocol.permissions import SandboxPermissions
+from miqi.runtime.agent_registry import AgentMetadata
 
 
 @dataclass
@@ -30,6 +30,9 @@ class TurnContext:
     session_id: str = ""
     # Execution policy: "plan" | "manual" | "edit" | "auto"
     execution_policy: str = "edit"
+    # #680: reasoning mode ("fast" | "think") — generation budget + prompts
+    # applied by the turn executor (desktop chain).
+    reasoning_mode: str | None = None
     temperature: float = 0.1
     max_tokens: int = 8192
     # Permissions
@@ -48,3 +51,7 @@ class TurnContext:
     # Execution policy flags for approval layer
     bypass_approval: bool = False    # skip all approval checks
     force_approval: bool = False     # require approval even if switch is off
+    # #821: directories the user mentioned in this turn's messages
+    # (auto-sensed by the turn runner; injected into file tools as
+    # ``_user_roots`` via ToolRuntime/orchestrator).  Host Paths.
+    user_mentioned_roots: list[Path] = field(default_factory=list)

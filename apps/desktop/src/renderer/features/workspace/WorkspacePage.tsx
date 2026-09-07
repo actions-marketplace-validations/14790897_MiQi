@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { ContextMenu } from '../../components/ContextMenu';
 import type { FileNode } from '../../../shared/ipc';
+import { SandboxHtmlFrame } from '../chat/components/SandboxHtmlFrame';
 
 import { ConfirmDialog } from '../../components/shared';
 
@@ -103,6 +104,7 @@ export function WorkspacePage() {
       setFileLoading(true);
       setError(null);
       setCurrentPath(path);
+      if (/\.html?$/i.test(path)) setPreviewMode(true);
       window.miqi.files
         .read(path)
         .then((res) => {
@@ -249,6 +251,7 @@ export function WorkspacePage() {
 
   const isMdFile = currentPath?.endsWith('.md');
   const isPdfFile = currentPath?.toLowerCase().endsWith('.pdf');
+  const isHtmlFile = currentPath ? /\.html?$/i.test(currentPath) : false;
 
   if (loading) {
     return (
@@ -303,12 +306,12 @@ export function WorkspacePage() {
                 <FileText size={14} className="text-[var(--text-muted)] shrink-0" />
                 <span className="text-xs font-mono text-[var(--text)] truncate">{currentPath}</span>
                 {isUnsaved && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 shrink-0">
+                  <span className="text-size-2xs px-1.5 py-0.5 rounded font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 shrink-0">
                     未保存
                   </span>
                 )}
                 {isPdfFile && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 shrink-0">
+                  <span className="text-size-2xs px-1.5 py-0.5 rounded font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 shrink-0">
                     PDF
                   </span>
                 )}
@@ -354,7 +357,7 @@ export function WorkspacePage() {
                       <Save size={12} />
                       {saving ? '保存中…' : '保存'}
                     </button>
-                    {isMdFile && (
+                    {(isMdFile || isHtmlFile) && (
                       <div className="flex items-center gap-1 rounded-md border border-[var(--border-subtle)] overflow-hidden">
                         <button
                           onClick={() => setPreviewMode(false)}
@@ -397,6 +400,12 @@ export function WorkspacePage() {
                 <div className="w-full h-full overflow-y-auto px-5 py-4 text-[15px] leading-[1.7] text-[var(--text)] prose prose-sm max-w-none bg-transparent">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
                 </div>
+              ) : isHtmlFile && previewMode ? (
+                <SandboxHtmlFrame
+                  html={content}
+                  className="w-full h-full border-0"
+                  maxHeight="100%"
+                />
               ) : (
                 <textarea
                   value={content}
@@ -438,7 +447,9 @@ export function WorkspacePage() {
       {actionTarget && actionTarget.type === 'rename' ? (
         <InputDialog
           open={!!actionTarget}
-          onOpenChange={(o) => { if (!o) setActionTarget(null); }}
+          onOpenChange={(o) => {
+            if (!o) setActionTarget(null);
+          }}
           title="重命名"
           label="新名称"
           defaultValue={actionTarget.currentName}
@@ -447,7 +458,9 @@ export function WorkspacePage() {
       ) : actionTarget && (actionTarget.type === 'newFile' || actionTarget.type === 'newFolder') ? (
         <InputDialog
           open={!!actionTarget}
-          onOpenChange={(o) => { if (!o) setActionTarget(null); }}
+          onOpenChange={(o) => {
+            if (!o) setActionTarget(null);
+          }}
           title={actionTarget.type === 'newFile' ? '新建文件' : '新建文件夹'}
           label={actionTarget.type === 'newFile' ? '文件名' : '文件夹名'}
           onConfirm={handleCreate}
@@ -590,7 +603,7 @@ function FileTree({
           </div>
         )}
         {open && children.length === 0 && (
-          <div className="ml-7 text-[10px] text-[var(--text-faint)] py-0.5">（空）</div>
+          <div className="ml-7 text-size-2xs text-[var(--text-faint)] py-0.5">（空）</div>
         )}
       </div>
     );

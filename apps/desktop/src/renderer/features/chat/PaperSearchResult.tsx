@@ -15,6 +15,10 @@ import {
   ExternalLink,
   Loader2,
   CheckCircle,
+  Check,
+  FolderOpen,
+  AlertCircle,
+  RotateCw,
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
@@ -34,6 +38,7 @@ export interface PaperItem {
   reference_count?: number | null;
   is_open_access?: boolean;
   open_access_pdf_url?: string;
+  pdf_url?: string; // #667: 直接下载直链
   source?: string;
   source_url?: string;
 }
@@ -88,10 +93,13 @@ function PaperCard({
   paper,
   onDownload,
   isDownloading,
+  downloadState,
 }: {
   paper: PaperItem;
   onDownload: (paper: PaperItem) => void;
   isDownloading: boolean;
+  /** #668 补：下载结果反馈（成功路径 + 打开文件夹 / 失败原因） */
+  downloadState?: { status: 'done' | 'failed'; savePath?: string; error?: string };
 }) {
   const [showAbstract, setShowAbstract] = useState(false);
   const hasAbstract = paper.abstract?.trim().length > 10;
@@ -113,10 +121,7 @@ function PaperCard({
             className="text-sm font-semibold leading-snug min-w-0 flex-1 break-words"
             style={{ color: 'var(--text-primary)' }}
           >
-            <FileText
-              size={14}
-              className="inline mr-1.5 shrink-0 text-text-muted"
-            />
+            <FileText size={14} className="inline mr-1.5 shrink-0 text-text-muted" />
             {paper.title || '无标题'}
           </h4>
           {paper.year && (
@@ -133,9 +138,7 @@ function PaperCard({
         </div>
 
         {/* Authors + citation count */}
-        <div
-          className="flex items-center gap-3 mt-1 flex-wrap text-xs text-text-muted"
-        >
+        <div className="flex items-center gap-3 mt-1 flex-wrap text-xs text-text-muted">
           <span className="inline-flex items-center gap-1">
             <Users size={11} />
             {fmtAuthors(paper.authors)}
@@ -183,7 +186,7 @@ function PaperCard({
       >
         {/* Source badge */}
         <span
-          className="text-[10px] px-1.5 py-0.5 rounded-full"
+          className="text-size-2xs px-1.5 py-0.5 rounded-full"
           style={{
             background: 'var(--tag-bg, var(--bg-tertiary))',
             color: 'var(--tag-text, var(--text-faint))',
@@ -197,7 +200,7 @@ function PaperCard({
             href={paper.source_url}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 text-[10px] hover:underline text-text-muted"
+            className="inline-flex items-center gap-1 text-size-2xs hover:underline text-text-muted"
           >
             <ExternalLink size={10} />
             Source
@@ -206,8 +209,57 @@ function PaperCard({
 
         <div className="flex-1" />
 
-        {/* Download PDF button */}
-        {hasPdf && (
+        {/* Download PDF button + 结果反馈（#668 补：成功/失败不再静默） */}
+        {hasPdf && downloadState?.status === 'done' && (
+          <div className="inline-flex items-center gap-2">
+            <span
+              className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium"
+              style={{
+                background: 'var(--success-bg, #d4f5e0)',
+                color: 'var(--success-text, #1d7e3a)',
+              }}
+            >
+              <Check size={12} /> 已下载
+            </span>
+            {downloadState.savePath && (
+              <button
+                onClick={() => window.miqi.files?.openContainingFolder(downloadState.savePath!)}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium cursor-pointer hover:underline"
+                style={{
+                  background: 'none',
+                  border: '1px solid var(--border)',
+                  color: 'var(--text-muted)',
+                }}
+              >
+                <FolderOpen size={12} /> 打开文件夹
+              </button>
+            )}
+          </div>
+        )}
+        {hasPdf && downloadState?.status === 'failed' && (
+          <span className="inline-flex items-center gap-1.5">
+            <span
+              className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium"
+              style={{ background: 'var(--danger-bg, #f8e8e8)', color: 'var(--danger, #c04040)' }}
+              title={downloadState.error}
+            >
+              <AlertCircle size={12} /> 下载失败
+              {downloadState.error ? `：${downloadState.error}` : ''}
+            </span>
+            <button
+              onClick={() => onDownload(paper)}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium cursor-pointer hover:underline"
+              style={{
+                background: 'none',
+                border: '1px solid var(--border)',
+                color: 'var(--text-muted)',
+              }}
+            >
+              <RotateCw size={11} /> 重试
+            </button>
+          </span>
+        )}
+        {hasPdf && (!downloadState || downloadState.status === undefined) && (
           <button
             onClick={() => onDownload(paper)}
             disabled={isDownloading}
@@ -237,10 +289,19 @@ export default function PaperSearchResult({
   data,
   onDownloadPaper,
   downloadingId,
+  paperDownloadStates,
+  downloadStateKeyPrefix,
 }: {
   data: PaperSearchPayload;
   onDownloadPaper: (paper: PaperItem) => void;
   downloadingId: string | null;
+  /** #668 补：下载结果反馈（paperId → done/failed + savePath/error） */
+  paperDownloadStates?: Record<
+    string,
+    { status: 'done' | 'failed'; savePath?: string; error?: string }
+  >;
+  /** #696 补：session 前缀键（防跨会话串状态，CodeRabbit） */
+  downloadStateKeyPrefix?: string;
 }) {
   const items = data.items ?? [];
 
@@ -270,10 +331,10 @@ export default function PaperSearchResult({
   return (
     <div className="my-1">
       {/* Search meta */}
-      <div
-        className="flex min-w-0 flex-wrap items-center gap-2 mb-2 text-[11px] text-text-muted"
-      >
-        <span className="min-w-0 break-words">{data.query ? `"${data.query}"的搜索结果` : '搜索结果'}</span>
+      <div className="flex min-w-0 flex-wrap items-center gap-2 mb-2 text-size-2xs text-text-muted">
+        <span className="min-w-0 break-words">
+          {data.query ? `"${data.query}"的搜索结果` : '搜索结果'}
+        </span>
         {data.total != null && (
           <span style={{ color: 'var(--text-faint)' }}>
             · {data.total} found · showing {items.length}
@@ -281,7 +342,7 @@ export default function PaperSearchResult({
         )}
         {data.source && (
           <span
-            className="px-1 py-0.5 rounded text-[10px]"
+            className="px-1 py-0.5 rounded text-size-2xs"
             style={{
               background: 'var(--tag-bg, var(--bg-tertiary))',
               color: 'var(--tag-text, var(--text-faint))',
@@ -299,6 +360,7 @@ export default function PaperSearchResult({
           paper={paper}
           onDownload={onDownloadPaper}
           isDownloading={downloadingId === paper.id}
+          downloadState={paperDownloadStates?.[`${downloadStateKeyPrefix ?? ''}:${paper.id || ''}`]}
         />
       ))}
     </div>

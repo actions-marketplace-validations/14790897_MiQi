@@ -1,138 +1,297 @@
 @import 'tailwindcss';
 @import '@fontsource/inter';
+@import '@fontsource/jetbrains-mono';
+@import '@fontsource/jetbrains-mono/600.css';
 
 /* ------------------------------------------------------------------ */
-/* MiQi Desktop — Design Tokens (原型配色)                              */
+/* MiQroForge Desktop — Design Tokens (原型配色)                              */
 /* ------------------------------------------------------------------ */
 
 :root {
-  /* Backgrounds */
-  --background: #f5f6e5;          /* chat area — 抹茶色 */
-  --surface: #FFFFFF;             /* sidebar / nav — 纯白 */
-  --surface-muted: #F2F2F0;       /* input area / muted — 浅灰 */
-  --surface-elevated: #FFFFFF;
+  /* Backgrounds — 用户三图指定配色(#828):侧栏微蓝白 #F4F7FF(图2/3),
+     中间纯白 #FFFFFF,右面板 #FAFAFB(图2 微区分) */
+  --background: #ffffff;          /* chat area — 纯白(中间) */
+  --surface: #ffffff;             /* panels / surfaces — 纯白 */
+  --surface-muted: #f2f3f5;       /* input area / muted */
+  --surface-hover: #eceef0;
+  --surface-elevated: #ffffff;
+  --surface-3: #e9eaec;
 
-  /* Top nav — 纯白底色 */
-  --topbar-bg: #FFFFFF;
-  --topbar-text: #121212;
-  --topbar-border: #E4E4E0;
-  --topbar-muted-text: #888888;
+  /* Top nav */
+  --topbar-bg: #ffffff;
+  --topbar-text: #17171a;
+  --topbar-border: #e4e5e8;
+  --topbar-muted-text: #7c7c84;
 
-  /* Avatar / Logo 深色块 */
-  --avatar-dark: #2A2A48;        /* 用户头像 / Logo 深靛蓝 */
+  /* Avatar / Logo */
+  --avatar-dark: #232d4b;
 
-  /* Sidebar */
-  --sidebar-bg: #fafaf9;
-  --sidebar-border: #E4E4E0;
-  --sidebar-active-border: var(--accent); /* left highlight bar for active nav */
+  /* Workspace sidebar — 中性浅灰白(图1/2 认可款) */
+  --sidebar-bg: #f6f7f8;
+  --sidebar-border: #e4e5e8;
+  --sidebar-active-border: var(--accent);
 
-  /* Right panel */
-  --panel-bg: #FFFFFF;
-  --panel-border: #E4E4E0;
+  /* Right panel — 极浅灰白(图2) */
+  --panel-bg: #fafafb;
+  --panel-border: #e4e5e8;
 
-  /* Borders */
-  --border: #D0D0D0;             /* 输入框边框 */
-  --border-subtle: #E4E4E0;      /* 侧边分割线 / 卡片边框 */
+  /* Borders — 极浅细边 */
+  --border: #dcdde0;             /* input / strong borders */
+  --border-strong: #cfd0d4;
+  --border-subtle: #e4e5e8;      /* hairline dividers */
 
-  /* Text */
-  --text: #121212;               /* 主标题 / 菜单文字 */
-  --text-muted: #555555;         /* 次要描述文字 */
-  --text-faint: #888888;         /* 辅助小字 / 时间 */
+  /* Text — Hermes 式近黑 + 分层 */
+  --text: #17171a;
+  --text-muted: #4a4a52;
+  --text-faint: #7c7c84;
+  --muted-foreground: var(--text-muted);
+  --placeholder: #8a8f98;
+  /* Typography scale — fixed rem hierarchy (root 15px → 13–28px) */
+  --text-2xs: 0.875rem;         /* 13px label / badge */
+  --text-xs: 0.9375rem;         /* 14px caption / timestamp */
+  --text-sm: 1rem;              /* 15px secondary UI */
+  --text-base: 1.0625rem;       /* 16px body */
+  --text-md: 1.125rem;          /* 17px subheading */
+  --text-lg: 1.25rem;           /* 19px section title */
+  --text-xl: 1.5rem;            /* 23px page title */
+  --text-2xl: 1.875rem;         /* 28px display */
 
-  /* Accent — 亮黄色 */
-  --accent: #FFC107;             /* 高亮操作按钮 (SHARE TASK / EDIT / MERGE / SEND) */
-  --accent-hover: #e0b830;
-  --accent-soft: #F9E8B0;        /* MERGE ALL CHANGES 底部按钮 */
-  --accent-text: #121212;        /* 深色文字配亮黄底 */
+  --leading-tight: 1.3;
+  --leading-snug: 1.45;
+  --leading-normal: 1.6;
+  --leading-relaxed: 1.7;
 
-  /* Status colors */
-  --success: #36C860;            /* 绿色同步标记 */
+  --font-display:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+
+  --font-regular: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+  --font-bold: 700;
+
+  /* Accent — MiQroForge 品牌色 #EA653D（#828） */
+  --accent: #ea653d;
+  --accent-hover: #d4572e;
+  --accent-soft: rgba(234, 101, 61, 0.12);
+  --accent-strong: #ea653d;
+  --accent-text: #ffffff;
+
+  /* Status colors — 品牌规范功能色（#828）
+     浅色主题:规范色值(#FF6161 等)为暗底设计,12px 文本在白底
+     对比度不足(2.0-3.4:1)→ 浅色用保持色相的深档变体(≥4.5:1),
+     暗色主题保持规范原值。 */
+  --success: #087a4f;
+  --success-text: #087a4f;
   --success-bg: #d4f5e0;
-  --warning: #F9D048;
-  --warning-bg: #F9E8B0;
+  --warning: #b45309;
+  --warning-bg: #fdeed2;
   --approval-warning: #7c2d12;
   --approval-warning-strong: #c2410c;
   --approval-warning-bg: #fff7ed;
   --approval-warning-border: #fb923c;
   --approval-warning-pill-bg: #9a3412;
   --approval-warning-pill-text: #ffffff;
-  --bypass: #f59e0b;
+  --bypass: #b45309;
   --bypass-bg: #fffbeb;
   --danger: #c04040;
-  --danger-bg: #F8E8E8;          /* ACTIVE FOR EDIT 文件卡片 */
-  --info: #2066D0;               /* 链接 / 高亮提示蓝 */
-  --info-bg: #E0EDFF;            /* IN-PROGRESS 标签底色 */
+  --danger-bg: #ffe4e4;
+  --info: #1d6fd8;
+  --info-bg: #e0edff;
 
   /* Chat bubbles */
-  --bubble-user-bg: #2A2A48;     /* 用户发送气泡 — 深靛蓝黑 */
-  --bubble-user-text: #FFFFFF;
-  --bubble-ai-bg: #FFFFFF;       /* Agent 回复气泡 — 纯白 */
-  --bubble-ai-text: #222222;
-  --bubble-ai-border: #E4E4E0;
+  --bubble-user-bg: #4e5e73;
+  --bubble-user-text: #ffffff;
+  --bubble-ai-bg: #ffffff;
+  --bubble-ai-text: #1c1c20;
+  --bubble-ai-border: #e4e4e7;
 
   /* Task status tags */
-  --tag-review-bg: #fef3d0;      /* REVIEW 标签（黄色/琥珀色） */
+  --tag-review-bg: #fdeed2;      /* REVIEW 标签（提示色 #F59E0B） */
   --tag-review-text: #a06000;
-  --tag-completed-bg: rgba(32,102,208,0.12);   /* COMPLETED 标签（蓝色） */
-  --tag-completed-text: #2066D0;
-  --tag-inprogress-bg: #0F766E;  /* IN-PROGRESS 标签（深青绿） */
+  --tag-completed-bg: rgba(29,111,216,0.12);   /* COMPLETED 标签(执行色深档 #1D6FD8,12px 文本可读) */
+  --tag-completed-text: #1d6fd8;
+  --tag-inprogress-bg: #3b82f6;  /* IN-PROGRESS 标签（执行色 #3B82F6，#828） */
   --tag-inprogress-text: #FFFFFF;
   --tag-cc-bg: rgba(124,58,237,0.12);          /* CC 标签（紫色） */
   --tag-cc-text: #7C3AED;
 
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
   --radius: 8px;
+  --shadow: 0 1px 2px rgba(23, 24, 28, 0.03), 0 16px 40px rgba(23, 24, 28, 0.06);
+  --ui-contrast: 45%;
+  --code-font-size: 14px;
+
+  /* Code block surface + syntax tokens (rehype-highlight) — derived from
+     design tokens so both themes stay on-family. */
+  --code-bg: color-mix(in srgb, var(--background) 76%, var(--border));
+  --code-token-keyword: color-mix(in srgb, var(--danger) 80%, var(--text));
+  --code-token-string: color-mix(in srgb, var(--success) 66%, var(--text));
+  --code-token-comment: var(--text-faint);
+  --code-token-function: color-mix(in srgb, var(--accent) 55%, var(--danger));
+  --code-token-number: color-mix(in srgb, var(--warning) 55%, var(--text));
+  --code-token-builtin: color-mix(in srgb, var(--info) 62%, var(--text));
+  --code-token-type: color-mix(in srgb, var(--bypass) 62%, var(--text));
+  --code-token-attr: color-mix(in srgb, var(--danger) 50%, var(--text));
+  --code-token-meta: var(--text-faint);
+
+  /* Table surface (Markdown) — 从背景色派生，抹茶/白色/自定义背景都自动协调 */
+  --table-border: color-mix(in srgb, var(--background) 84%, var(--text));
+  --table-head-bg: color-mix(in srgb, var(--background) 92%, var(--text));
+  --table-stripe: color-mix(in srgb, var(--background) 96%, var(--text));
+
+  color-scheme: light;
+}
+
+/* 浅色第二顺位(用户参考图 12-57):冷蓝灰调,白色卡片提层次,
+   外观设置一键切换(light-soft 类,由 applyTheme 控制) */
+:root.light-soft {
+  --background: #fafafa;          /* 中间 — 极浅冷灰白 */
+  --surface: #ffffff;             /* 白色卡片提升层级 */
+  --surface-muted: #f2f3f5;
+  --surface-hover: #eceef0;
+  --surface-elevated: #ffffff;
+  --surface-3: #e9eaec;
+  --topbar-bg: #fafafa;
+  --topbar-border: #e4e5e8;
+  --sidebar-bg: #f7f7f8;          /* 侧栏 — 冷灰略深 */
+  --sidebar-border: #e4e5e8;
+  --panel-bg: #fafafb;            /* 右面板 */
+  --panel-border: #e4e5e8;
+  --border: #dcdde0;
+  --border-strong: #cfd0d4;
+  --border-subtle: #e4e5e8;
+  --bubble-ai-bg: #ffffff;
+  --bubble-ai-border: #e4e5e8;
+}
+
+/* 浅色第三顺位(冰蓝):Hermes 微蓝白调,外观设置一键切换 */
+:root.light-ice {
+  --background: #f8f9fe;          /* 中间 — 微蓝白 */
+  --surface: #ffffff;
+  --surface-muted: #f0f1f6;
+  --surface-hover: #e9ebf2;
+  --surface-elevated: #ffffff;
+  --surface-3: #e6e8ef;
+  --topbar-bg: #f8f9fe;
+  --topbar-border: #e2e4ea;
+  --sidebar-bg: #f3f7ff;          /* 侧栏 — 冰蓝 */
+  --sidebar-border: #e2e4ea;
+  --panel-bg: #fafafb;
+  --panel-border: #e2e4ea;
+  --border: #dcdde3;
+  --border-strong: #cfd0d8;
+  --border-subtle: #e2e4ea;
+  --bubble-ai-bg: #ffffff;
+  --bubble-ai-border: #e2e4ea;
 }
 
 .dark {
-  --background: #1a1a1a;
-  --surface: #242424;
-  --surface-muted: #2e2e2e;
-  --surface-elevated: #333333;
-  --topbar-bg: #242424;
-  --topbar-text: #E4E4E0;
-  --topbar-muted-text: #888888;
-  --topbar-border: #3a3a3a;
-  --avatar-dark: #5a5a7a;
-  --sidebar-bg: #242424;
-  --sidebar-border: #3a3a3a;
-  --panel-bg: #242424;
-  --panel-border: #3a3a3a;
-  --border: #444444;
-  --border-subtle: #3a3a3a;
-  --text: #E4E4E0;
-  --text-muted: #A0A0A0;
-  --text-faint: #707070;
-  --accent: #F9D048;
-  --accent-hover: #e0b830;
-  --accent-soft: #4a3a10;
-  --accent-text: #121212;
-  --success: #4ade80;
-  --success-bg: rgba(74, 222, 128, 0.16);
-  --warning: #facc15;
-  --warning-bg: rgba(250, 204, 21, 0.16);
+  /* Backgrounds — MiQroForge 品牌规范（#828）:主背景/一级层次/二级层次 */
+  --background: #08090a;
+  --surface: #0f1011;
+  --surface-muted: #161718;
+  --surface-hover: #1b1c1e;
+  --surface-elevated: #1b1c1e;
+  --surface-3: #161718;
+  --topbar-bg: #0f1011;
+  --topbar-text: #f4f4f6;
+  --topbar-muted-text: #8a8f98;
+  --topbar-border: #26272a;
+  --avatar-dark: #232d4b;
+  --sidebar-bg: #0f1011;
+  --sidebar-border: #26272a;
+  --panel-bg: #0f1011;
+  --panel-border: #26272a;
+  --border: #3a3c40;
+  --border-strong: #4d4f54;
+  --border-subtle: #202124;
+  /* Text — 品牌规范文字层级（暗色主题） */
+  --text: #f4f4f6;              /* 强调/标题 */
+  --text-muted: #d0d6e0;        /* 次强调/文本描述 */
+  --text-faint: #8a8f98;        /* 辅助文本 */
+  --muted-foreground: var(--text-muted);
+  --placeholder: #62666d;       /* 弱文本 */
+  /* Accent — 品牌色 #EA653D */
+  --accent: #ea653d;
+  --accent-hover: #f07a52;
+  --accent-soft: rgba(234, 101, 61, 0.22);
+  --accent-strong: #ea653d;
+  --accent-text: #ffffff;
+  --ui-contrast: 60%;
+  /* Status colors — 品牌规范功能色（#828） */
+  --success: #10b981;
+  --success-text: #10b981;
+  --success-bg: rgba(16, 185, 129, 0.16);
+  --warning: #f59e0b;
+  --warning-bg: rgba(245, 158, 11, 0.16);
   --approval-warning: #fed7aa;
   --approval-warning-strong: #f97316;
   --approval-warning-bg: #3b2418;
   --approval-warning-border: #c2410c;
   --approval-warning-pill-bg: #f97316;
   --approval-warning-pill-text: #1f130b;
-  --danger: #f87171;
-  --danger-bg: rgba(248, 113, 113, 0.16);
-  --info: #60a5fa;
-  --info-bg: rgba(96, 165, 250, 0.16);
-  --bubble-user-bg: #3a3a5a;
-  --bubble-user-text: #FFFFFF;
-  --bubble-ai-bg: #2e2e2e;
-  --bubble-ai-text: #E4E4E0;
-  --bubble-ai-border: #444444;
-  --tag-review-bg: rgba(250, 204, 21, 0.18);
-  --tag-review-text: #facc15;
-  --tag-completed-bg: rgba(96, 165, 250, 0.18);
+  --danger: #ff6161;
+  --danger-bg: rgba(255, 97, 97, 0.16);
+  --info: #3b82f6;              /* 执行色 */
+  --info-bg: rgba(59, 130, 246, 0.16);
+  --bubble-user-bg: #4e5e73;
+  --bubble-user-text: #ffffff;
+  --bubble-ai-bg: #161718;
+  --bubble-ai-text: #d0d6e0;
+  --bubble-ai-border: #26272a;
+  --tag-review-bg: rgba(245, 158, 11, 0.18);
+  --tag-review-text: #f59e0b;
+  --tag-completed-bg: rgba(59, 130, 246, 0.18);
   --tag-completed-text: #93c5fd;
-  --tag-inprogress-bg: #14B8A6;
+  --tag-inprogress-bg: #3b82f6;  /* IN-PROGRESS 标签（执行色 #3B82F6，#828） */
   --tag-inprogress-text: #ffffff;
   --tag-cc-bg: rgba(168, 85, 247, 0.18);
   --tag-cc-text: #c4b5fd;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 16px 40px rgba(0, 0, 0, 0.28);
+
+  --code-bg: color-mix(in srgb, var(--background) 96%, #ffffff);
+  --code-token-keyword: var(--accent);
+  --code-token-string: var(--success);
+  --code-token-comment: var(--text-faint);
+  --code-token-function: color-mix(in srgb, var(--accent) 50%, var(--info));
+  --code-token-number: var(--warning);
+  --code-token-builtin: color-mix(in srgb, var(--info) 78%, #ffffff);
+  --code-token-type: var(--bypass);
+  --code-token-attr: var(--danger);
+  --code-token-meta: var(--text-faint);
+
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------------------ */
+/* MiQroForge 品牌 Logo 主题切换（#828）                                */
+/* 浅色 → 彩色版（标志2）;暗色 → 白色版（标志1）                        */
+/* ------------------------------------------------------------------ */
+
+.logo-theme-light {
+  display: inline-block;
+}
+
+.logo-theme-dark {
+  display: none;
+}
+
+.dark .logo-theme-light {
+  display: none;
+}
+
+.dark .logo-theme-dark {
+  display: inline-block;
 }
 
 /* ------------------------------------------------------------------ */
@@ -152,6 +311,7 @@
   --color-accent: var(--accent);
   --color-accent-hover: var(--accent-hover);
   --color-accent-soft: var(--accent-soft);
+  --color-accent-strong: var(--accent-strong);
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-danger: var(--danger);
@@ -159,15 +319,112 @@
   --border-radius-lg: var(--radius);
 
   --font-sans:
-    'Inter', 'PingFang SC', 'Microsoft YaHei', ui-sans-serif, system-ui,
-    -apple-system, blinkmacsystemfont, 'Segoe UI', sans-serif;
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+
+  --font-mono:
+    'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas,
+    monospace;
+}
+
+html[data-font-family='system'] {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+}
+
+html[data-font-family='yahei'] {
+  --font-sans:
+    'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Segoe UI',
+    sans-serif;
+}
+
+html[data-font-family='dengxian'] {
+  --font-sans:
+    'DengXian', 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', sans-serif;
+}
+
+html[data-font-family='simhei'] {
+  --font-sans:
+    'SimHei', 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', sans-serif;
+}
+
+html[data-font-family='kaiti'] {
+  --font-sans:
+    'KaiTi', 'KaiTi SC', 'STKaiti', 'Microsoft YaHei', 'PingFang SC',
+    sans-serif;
+}
+
+html[data-font-family='simsun'] {
+  --font-sans:
+    'SimSun', 'NSimSun', 'Songti SC', 'STSong', 'Microsoft YaHei', serif;
+}
+
+html[data-font-family='fangsong'] {
+  --font-sans:
+    'FangSong', 'STFangsong', 'SimSun', 'Microsoft YaHei', serif;
+}
+
+html[data-font-family='youyuan'] {
+  --font-sans:
+    'YouYuan', 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', sans-serif;
+}
+
+html[data-font-family='yahei'] body,
+html[data-font-family='dengxian'] body,
+html[data-font-family='simhei'] body,
+html[data-font-family='kaiti'] body,
+html[data-font-family='simsun'] body,
+html[data-font-family='fangsong'] body,
+html[data-font-family='youyuan'] body,
+html[data-font-family='source'] body {
+  font-synthesis-weight: none;
+}
+
+html[data-font-family='inter'] {
+  --font-sans:
+    'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+}
+
+html[data-font-family='source'] {
+  --font-sans:
+    'Source Han Sans SC', 'Noto Sans CJK SC', 'PingFang SC', 'Microsoft YaHei',
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', ui-sans-serif, system-ui,
+    sans-serif;
+}
+
+html[data-font-family='pingfang'] {
+  --font-sans:
+    'PingFang SC', 'HarmonyOS Sans SC', 'Source Han Sans SC', 'Noto Sans CJK SC',
+    -apple-system, BlinkMacSystemFont, 'Microsoft YaHei', 'Segoe UI',
+    ui-sans-serif, system-ui, sans-serif;
 }
 
 /* ------------------------------------------------------------------ */
 /* Global styles                                                       */
 /* ------------------------------------------------------------------ */
 
-html,
+html {
+  font-size: 16px;
+}
+
+html[data-font-scale='sm'] {
+  font-size: 14px;
+}
+
+html[data-font-scale='md'] {
+  font-size: 16px;
+}
+
+html[data-font-scale='lg'] {
+  font-size: 17px;
+}
+
+html[data-font-scale='xl'] {
+  font-size: 18px;
+}
+
 body,
 #root {
   height: 100%;
@@ -176,19 +433,246 @@ body,
   overflow: hidden;
   background: var(--background);
   color: var(--text);
-  font-family: var(--font-sans);
-  font-size: 14px;
-  line-height: 1.5;
+  font-family:
+    var(--font-sans), 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji',
+    sans-serif;
+  font-size: inherit;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizelegibility;
+  text-rendering: auto;
 }
 
-/* Scrollbar */
+/* Emoji is only applied via the data-emoji-mode attribute so the
+   default (no attribute) stays at the browser default (auto). Keeps
+   macOS Electron from miscomputing element visibility when the
+   experimental font-variant-emoji property is set on body. */
+html[data-emoji-mode='mono'] body,
+html[data-emoji-mode='mono'] #root {
+  font-variant-emoji: text;
+}
+
+html[data-emoji-mode='color'] body,
+html[data-emoji-mode='color'] #root {
+  font-variant-emoji: emoji;
+}
+
+/* Emoji-aware icons: color emoji mode swaps lucide glyphs for color
+   emoji characters, mono mode falls back to the single-color icon. */
+.icon-mono {
+  display: inline-flex;
+}
+.icon-color {
+  display: none;
+}
+html[data-emoji-mode='color'] .icon-mono {
+  display: none;
+}
+html[data-emoji-mode='color'] .icon-color {
+  display: inline-flex;
+}
+
+/* Keyboard focus indicator — text inputs are excluded because Chromium
+   matches :focus-visible on them even for mouse clicks, which drew an
+   accent outline on every focused input/textarea. Text inputs keep their
+   focus:border feedback instead of any outline. */
+:focus-visible:not(input):not(textarea):not(select):not([contenteditable='true']) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Range sliders — thin track with accent thumb and fill */
+.range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 9999px;
+  background:
+    linear-gradient(to right, var(--accent) var(--range-fill, 50%), var(--border-subtle) var(--range-fill, 50%));
+  outline: none;
+  cursor: pointer;
+}
+.range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: transform 0.15s;
+}
+.range::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+.range::-webkit-slider-thumb:active {
+  transform: scale(1.3);
+}
+
+html[data-pointer-cursor='true'] button,
+html[data-pointer-cursor='true'] [role='button'],
+html[data-pointer-cursor='true'] a,
+html[data-pointer-cursor='true'] input[type='checkbox'],
+html[data-pointer-cursor='true'] input[type='radio'],
+html[data-pointer-cursor='true'] select,
+html[data-pointer-cursor='true'] summary {
+  cursor: pointer;
+}
+
+html[data-reduce-motion='true'] *,
+html[data-reduce-motion='true'] *::before,
+html[data-reduce-motion='true'] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+html[data-sidebar-glass='true'] .sidebar-shell {
+  background: color-mix(in srgb, var(--sidebar-bg) 85%, transparent) !important;
+  backdrop-filter: blur(12px);
+}
+
+html.dark[data-sidebar-glass='true'] .sidebar-shell {
+  background: color-mix(in srgb, var(--sidebar-bg) 87%, transparent) !important;
+}
+
+.sidebar-shell {
+  background: var(--sidebar-bg);
+  border-color: var(--sidebar-border);
+  color: var(--text);
+  font-family:
+    var(--font-sans), 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji',
+    sans-serif;
+}
+.sidebar-shell .text-text {
+  color: var(--text);
+}
+.sidebar-shell .text-text-muted {
+  color: var(--text-muted);
+}
+.sidebar-shell .text-text-faint {
+  color: var(--text-faint);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--placeholder);
+}
+
+/* Typography utilities — fixed hierarchy */
+.text-label {
+  font-size: var(--text-2xs);
+  line-height: var(--leading-tight);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0;
+}
+
+.text-caption {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  font-weight: var(--font-regular);
+  letter-spacing: 0;
+}
+
+.text-body-sm {
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+  font-weight: var(--font-regular);
+  letter-spacing: 0;
+}
+
+.text-body {
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  font-weight: var(--font-regular);
+  letter-spacing: 0;
+}
+
+.text-body-lg {
+  font-size: var(--text-md);
+  line-height: var(--leading-relaxed);
+  font-weight: var(--font-regular);
+  letter-spacing: 0;
+}
+
+.text-subheading {
+  font-size: var(--text-md);
+  line-height: var(--leading-snug);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0;
+}
+
+.text-section-title {
+  font-size: var(--text-lg);
+  line-height: var(--leading-snug);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0;
+  text-wrap: balance;
+}
+
+.text-page-title {
+  font-size: var(--text-xl);
+  line-height: var(--leading-tight);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0;
+  text-wrap: balance;
+}
+
+.text-display {
+  font-size: var(--text-2xl);
+  line-height: var(--leading-tight);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0;
+  text-wrap: balance;
+}
+
+.text-size-2xs {
+  font-size: var(--text-2xs);
+  line-height: var(--leading-tight);
+}
+
+.text-size-xs {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.text-size-sm {
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+.text-size-base {
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+}
+
+.text-size-md {
+  font-size: var(--text-md);
+  line-height: var(--leading-snug);
+}
+
+.text-size-lg {
+  font-size: var(--text-lg);
+  line-height: var(--leading-snug);
+}
+
+.text-size-xl {
+  font-size: var(--text-xl);
+  line-height: var(--leading-tight);
+}
+
+/* Scrollbar: keep a neutral gray thumb in both themes */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+}
 
 /* Code blocks */
 pre {
@@ -197,13 +681,18 @@ pre {
   border-radius: var(--radius);
   padding: 12px 16px;
   overflow-x: auto;
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: var(--code-font-size, 14px);
+  line-height: 1.6;
+  font-variant-ligatures: none;
+  tab-size: 4;
 }
 
 code {
-  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-family:
+    'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas,
+    monospace;
   font-size: 0.9em;
+  font-variant-ligatures: none;
 }
 
 :not(pre) > code {
@@ -212,26 +701,121 @@ code {
   border-radius: 4px;
 }
 
+/* Syntax highlighting (rehype-highlight) — hues derived from design tokens */
+.hljs {
+  color: var(--text);
+  background: transparent;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-doctag {
+  color: var(--code-token-keyword);
+  font-weight: 600;
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-addition {
+  color: var(--code-token-string);
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--code-token-comment);
+  font-style: italic;
+}
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-deletion {
+  color: var(--code-token-number);
+}
+.hljs-title,
+.hljs-title.function_,
+.hljs-function .hljs-title,
+.hljs-selector-id {
+  color: var(--code-token-function);
+}
+.hljs-built_in,
+.hljs-builtin-name {
+  color: var(--code-token-builtin);
+}
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-selector-class {
+  color: var(--code-token-type);
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-property,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-selector-attr,
+.hljs-selector-pseudo {
+  color: var(--code-token-attr);
+}
+.hljs-params,
+.hljs-operator {
+  color: var(--text-muted);
+}
+.hljs-meta,
+.hljs-section,
+.hljs-name,
+.hljs-tag {
+  color: var(--code-token-meta);
+}
+
+/* Markdown tables: 圆角容器 + 暖灰表头 + 斑马纹 */
+table {
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+  line-height: 1.55;
+  width: 100%;
+}
+
+th,
+td {
+  padding: 6px 11px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: var(--table-head-bg);
+  font-weight: 600;
+  border-bottom: 1px solid var(--table-border);
+}
+
+tbody td {
+  border-bottom: 1px solid var(--table-border);
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+tbody tr:nth-child(even) td {
+  background: var(--table-stripe);
+}
+
 /* Status tag utilities */
 .tag-review {
   background: var(--tag-review-bg);
   color: var(--tag-review-text);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   padding: 2px 6px;
   border-radius: 4px;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
 .tag-completed {
   background: var(--tag-completed-bg);
   color: var(--tag-completed-text);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   padding: 2px 6px;
   border-radius: 4px;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
@@ -254,11 +838,11 @@ code {
 .tag-cc {
   background: var(--tag-cc-bg);
   color: var(--tag-cc-text);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   padding: 2px 6px;
   border-radius: 4px;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   text-transform: uppercase;
 }
 
@@ -271,7 +855,7 @@ code {
 }
 
 .settings-hover-tab:hover {
-  transform: scale(1.08);
+  transform: translateY(-1px);
 }
 
 .settings-hover-card {
@@ -285,11 +869,11 @@ code {
 .settings-hover-card:hover {
   background-color: color-mix(in srgb, var(--surface) 94%, var(--accent-soft));
   border-color: var(--accent);
-  transform: translateY(-6px);
+  transform: translateY(-2px);
   box-shadow:
-    0 18px 42px rgba(42, 42, 72, 0.2),
-    0 6px 14px rgba(42, 42, 72, 0.12),
-    0 0 0 1px rgba(255, 193, 7, 0.35);
+    0 14px 36px rgba(0, 0, 0, 0.12),
+    0 4px 12px rgba(0, 0, 0, 0.08),
+    0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -312,7 +896,7 @@ code {
 }
 
 .settings-hover-sidebar:hover {
-  transform: scale(1.1);
+  transform: translateX(2px);
 }
 
 @keyframes approval-bypass-island-in {
@@ -337,6 +921,18 @@ code {
 @keyframes banner-in {
   from { opacity: 0; transform: translate(-50%, -8px) scale(0.96); }
   to   { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+
+/* Turn status pulse (issue #646: 等待你的确认) */
+@keyframes turn-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* Confirm card top accent line breathing (P0: 细条呼吸，非 glow) */
+@keyframes accent-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
 }
 @keyframes banner-out {
   from { opacity: 1; transform: translate(-50%, 0) scale(1); }

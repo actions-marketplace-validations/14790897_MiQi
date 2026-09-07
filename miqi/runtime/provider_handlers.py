@@ -17,28 +17,11 @@ from typing import Any
 
 from loguru import logger
 
+from miqi.providers.registry import PROVIDER_TEST_MODELS
 from miqi.runtime.app_server import AppServerError, get_bridge_state
-
 
 VERIFICATION_KEY = "providerVerification"
 VERIFICATION_STATUSES = {"success", "failed", "unverified"}
-PROVIDER_TEST_MODELS = {
-    "anthropic": "claude-opus-4-5",
-    "openai": "gpt-4.1",
-    "deepseek": "deepseek-v4-flash",
-    "gemini": "gemini-2.5-pro",
-    "moonshot": "kimi-k2.5",
-    "dashscope": "qwen-max",
-    "zhipu": "glm-4",
-    "minimax": "MiniMax-M2.7",
-    "aihubmix": "claude-opus-4.1",
-    "siliconflow": "deepseek-ai/DeepSeek-V3",
-    "vllm": "meta-llama/Llama-3.1-8B-Instruct",
-    "ollama_local": "llama3.2",
-    "ollama_cloud": "gpt-oss:20b-cloud",
-    "openrouter": "anthropic/claude-opus-4-5",
-    "custom": "default",
-}
 
 
 def _provider_fingerprint(provider_config: Any, model: str | None = None) -> str | None:
@@ -55,6 +38,84 @@ def _provider_fingerprint(provider_config: Any, model: str | None = None) -> str
         return None
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _provider_usable(pc: Any, spec: Any) -> bool:
+    """Whether a provider config holds usable credentials.
+
+    Used consistently by providers.list and the update auto-switch.
+    - local providers: api_base (user endpoint) counts as usable
+    - standard providers: an api_key is required; a stored default
+      endpoint without a key (e.g. auto-filled when the key was saved,
+      then the key cleared) is NOT usable credentials
+    """
+    if pc is None:
+        return False
+    if spec.is_local:
+        return bool(pc.api_base)
+    return bool(pc.api_key)
+
+
+def _pick_usable_default_model(config: Any, exclude: str | None = None) -> str:
+    """Pick a default model the runtime can actually use.
+
+    Prefers the first usable provider's test model (gateway/local entries are
+    full model ids; standard providers get "name/" prefixed). Returns the
+    empty string when nothing usable exists — an explicit "not selected"
+    state (UI shows 未设置 and prompts model selection), rather than an
+    unusable factory default that misrepresents the real state
+    （#933 review）.
+    """
+    from miqi.providers.registry import PROVIDERS
+
+    for spec in PROVIDERS:
+        if spec.name == exclude:
+            continue
+        pc = getattr(config.providers, spec.name, None)
+        if not _provider_usable(pc, spec):
+            continue
+        model = PROVIDER_TEST_MODELS.get(spec.name)
+        if not model:
+            continue
+        if spec.is_gateway or spec.is_local:
+            return model
+        return f"{spec.name}/{model}"
+    return ""
+
+
+def _model_provider_resolvable(config: Any, model: str) -> bool:
+    """Whether the model resolves to a USABLE provider at runtime.
+
+    镜像 Config._match_provider 的路由契约：模型自身 provider 必须持有可用
+    凭据（标准/gateway 需要 api_key，本地需要 api_base），或者有已配置的
+    gateway 可以兜底路由。仅注册表成员资格不够 —— 无凭据的 provider 会
+    落到 _match_provider 的「第一个已配置 provider」兜底，把模型发到错误
+    的 API（#929 review）。
+    """
+    from miqi.providers.registry import PROVIDERS, find_by_model, find_by_name
+
+    if not model or not str(model).strip():
+        return False
+    if model.lower().startswith("custom/"):
+        return False  # custom provider 已移除（#835），网关兜底不得复活它（#933 review）
+    model_prefix = model.split("/", 1)[0] if "/" in model else ""
+    spec = find_by_name(model_prefix) if model_prefix else find_by_model(model)
+    if spec is None:
+        spec = find_by_model(model)
+    if spec is not None:
+        pc = getattr(config.providers, spec.name, None)
+        if _provider_usable(pc, spec):
+            return True
+        # 归属 provider 无凭据时运行时还会继续走关键字与网关兜底 ——
+        # 不直接拒绝，交给下面的网关判定。
+    # 没有可用归属 provider —— 只有已配置的 gateway 能路由这个模型。
+    for gateway_spec in PROVIDERS:
+        if not gateway_spec.is_gateway:
+            continue
+        pc = getattr(config.providers, gateway_spec.name, None)
+        if _provider_usable(pc, gateway_spec):
+            return True
+    return False
 
 
 def _provider_verification_store(config: Any) -> dict[str, Any]:
@@ -99,14 +160,19 @@ async def providers_list_handler(
     Returns provider metadata: name, display_name, env_key, provider_type,
     configured status, api_key hint, default model, etc.
     """
-    from miqi.providers.registry import PROVIDERS
+    from miqi.providers.registry import PROVIDERS, find_by_model
 
     state = get_bridge_state(registry)
     config = state.load_config()
     model = config.agents.defaults.model
-    model_provider = config.get_provider_name(model)
+    # Only report the default model as "configured_model" when it genuinely
+    # belongs to this provider. get_provider_name() falls back to the first
+    # configured provider, which would mislabel e.g. "anthropic/claude-opus-4-5"
+    # as DeepSeek's configured model after the user saved a DeepSeek key —
+    # the wrong model was then sent to the DeepSeek API on test (#602).
+    matched_spec = find_by_model(model)
+    model_provider = matched_spec.name if matched_spec else None
     verification_store = _provider_verification_store(config)
-    activation_store = _provider_activation_store(config)
 
     providers_out = []
     for spec in PROVIDERS:
@@ -114,11 +180,7 @@ async def providers_list_handler(
         api_key = pc.api_key if pc else None
         hint = None
         builtin_available = spec.name in _BUILTIN_PROVIDERS
-        entry = activation_store.get(spec.name, {})
-        if isinstance(entry, bool):
-            builtin_activated = entry  # old format: {"deepseek": true}
-        else:
-            builtin_activated = bool(entry.get("builtin", False))
+        builtin_activated = config.is_builtin_activated(spec.name)
         if builtin_activated:
             # Hide the real key from the frontend for built-in activations
             hint = "企业共享密钥"
@@ -126,8 +188,12 @@ async def providers_list_handler(
             hint = api_key[:4] + "…" + api_key[-4:]
         elif api_key:
             hint = "***"
-        configured = bool(pc and (pc.api_key or pc.api_base))
-        provider_model = model if model_provider == spec.name else PROVIDER_TEST_MODELS.get(spec.name)
+        configured = _provider_usable(pc, spec)
+        provider_model = (
+            model
+            if configured and model_provider == spec.name
+            else PROVIDER_TEST_MODELS.get(spec.name)
+        )
         fingerprint = _provider_fingerprint(pc, provider_model)
         record = verification_store.get(spec.name)
         record_matches = (
@@ -154,7 +220,7 @@ async def providers_list_handler(
             "configured": configured,
             "api_key_hint": hint,
             "api_base": pc.api_base if pc else None,
-            "configured_model": model if model_provider == spec.name else None,
+            "configured_model": model if configured and model_provider == spec.name else None,
             "verification_status": verification_status,
             "verified_at": record.get("checkedAt") if record_matches else None,
             "verification_message": record.get("message") if record_matches else None,
@@ -188,6 +254,12 @@ async def providers_test_handler(
     api_base = params.get("api_base") or None
     requested_model = str(params.get("model") or "").strip()
 
+    # 后端收口（#835）：不再接受自配凭据，仅支持测试已保存的内置 key。
+    if api_key:
+        raise AppServerError("自定义 API Key 已禁用，仅支持内置密钥", code="NOT_SUPPORTED")
+    if api_base:
+        raise AppServerError("自定义 API Base 已禁用", code="NOT_SUPPORTED")
+
     if not provider_name:
         raise AppServerError("provider_name is required", code="INVALID_PARAMS")
 
@@ -203,6 +275,11 @@ async def providers_test_handler(
     state = get_bridge_state(registry)
     config = state.load_config()
     pc = getattr(config.providers, provider_name, None)
+
+    # 内置激活的 provider 强制走官方端点：历史遗留的自定义 api_base 不得与
+    # 内置共享密钥一起使用，防止密钥被发送到第三方地址（CodeRabbit #929）。
+    builtin_activated = config.is_builtin_activated(provider_name)
+
     test_model = (
         requested_model
         or PROVIDER_TEST_MODELS.get(provider_name)
@@ -217,8 +294,11 @@ async def providers_test_handler(
     if not api_key:
         if pc is not None:
             api_key = pc.api_key or ""
+            # 内置 key 只测官方默认端点，忽略遗留的自定义 api_base（防止内置
+            # 凭据被发到用户以前配过的第三方端点，CodeRabbit #929）。未内置
+            # 激活时保留历史行为：本地部署/遗留端点仍需读取保存的 api_base。
             if not api_base:
-                api_base = pc.api_base
+                api_base = None if builtin_activated else pc.api_base
 
     if not api_key:
         raise AppServerError(
@@ -306,76 +386,80 @@ async def providers_update_handler(
     session_id: str | None,
     registry: Any,
 ) -> dict[str, Any]:
-    """Update a single provider's api_key / api_base / extra_headers / model."""
+    """Update the default model only（自配凭据已禁用，#835 后端收口）。"""
     from miqi.config.loader import save_config
-    from miqi.config.schema import ProviderConfig, ProvidersConfig
     from miqi.providers.registry import find_by_name
 
     provider_name = params.get("provider_name", "").strip()
     if not provider_name:
         raise AppServerError("provider_name is required", code="INVALID_PARAMS")
 
-    valid_names = set(ProvidersConfig.model_fields.keys())
-    if provider_name not in valid_names:
+    # 后端收口（#835）：用 registry 白名单校验，而非存储 schema
+    #（schema 仍含 custom，但 runtime 已不支持它，CodeRabbit #929）。
+    spec = find_by_name(provider_name)
+    if spec is None:
         raise AppServerError(
             f"Unknown provider: {provider_name}", code="INVALID_PARAMS",
         )
-    spec = find_by_name(provider_name)
 
     state = get_bridge_state(registry)
     config = state.load_config()
+    # Snapshot before mutation — used for hot-reload classification (#789).
+    prev_config = config.model_copy(deep=True)
     pc = getattr(config.providers, provider_name, None)
     if pc is None:
         raise AppServerError(
             f"Provider config not found: {provider_name}", code="NOT_FOUND",
         )
 
-    update: dict[str, Any] = {}
-    if "api_key" in params:
-        update["api_key"] = str(params["api_key"])
-    if "api_base" in params:
-        v = params["api_base"]
-        update["api_base"] = str(v) if v else (spec.default_api_base if spec else None)
-    if "extra_headers" in params:
-        v = params["extra_headers"]
-        update["extra_headers"] = dict(v) if v else None
+    # 后端收口（#835）：拒绝自配凭据（api_key / api_base / extra_headers），
+    # 只允许更新默认模型（agents.defaults.model）。
+    if params.get("api_key"):
+        raise AppServerError("自定义 API Key 已禁用，请使用内置激活码", code="NOT_SUPPORTED")
+    if params.get("api_base"):
+        raise AppServerError("自定义 API Base 已禁用", code="NOT_SUPPORTED")
+    if params.get("extra_headers"):
+        raise AppServerError("自定义 Extra Headers 已禁用", code="NOT_SUPPORTED")
 
     model_override: str | None = None
     if "model" in params and params["model"]:
         model_override = str(params["model"]).strip()
 
-    if update.get("api_key") and "api_base" not in update and not getattr(pc, "api_base", None):
-        default_api_base = spec.default_api_base if spec else ""
-        if default_api_base:
-            update["api_base"] = default_api_base
-
-    if not update and not model_override:
+    if not model_override:
         raise AppServerError("No fields to update", code="INVALID_PARAMS")
 
-    if update:
-        current_dict = pc.model_dump(by_alias=False)
-        current_dict.update(update)
-        new_pc = ProviderConfig.model_validate(current_dict)
-        setattr(config.providers, provider_name, new_pc)
-        _set_provider_verification(
-            config,
-            provider_name,
-            "unverified",
-            _provider_fingerprint(new_pc, config.agents.defaults.model),
-            "Provider settings changed; test again to verify",
+    # 模型值必须能被运行时解析到「有凭据可用」的 provider（#929 review：
+    # 仅注册表成员资格不够，无凭据 provider 会兜底错发到错误 API）。
+    if not _model_provider_resolvable(config, model_override):
+        raise AppServerError(
+            f"Unsupported model: {model_override}", code="INVALID_PARAMS",
         )
-        # When user explicitly provides an API key (including empty to clear
-        # built-in activation), clear the built-in activation flag so the UI
-        # defaults to "own key" next time.
-        if "api_key" in update:
-            activation_store = _provider_activation_store(config)
-            activation_store.pop(provider_name, None)
 
-    if model_override:
-        config.agents.defaults.model = model_override
+    config.agents.defaults.model = model_override
 
     save_config(config)
     state.config = config
+
+    # Issue #789: hot-apply provider/model change to active sessions and
+    # broadcast config_updated so the UI shows "已生效" instead of forcing
+    # a restart. The provider is rebuilt for the next turn; an in-flight
+    # turn keeps the provider it captured.
+    try:
+        from miqi.runtime.config_handlers import hot_apply_and_broadcast
+
+        report, propagated = await hot_apply_and_broadcast(
+            registry, client_id, prev_config, config,
+        )
+        logger.info(
+            "providers.update: saved and hot-applied to {} session(s) "
+            "tiers: {} applied / {} new-session / {} restart",
+            propagated, len(report.applied), len(report.new_sessions_only),
+            len(report.restart_required),
+        )
+    except Exception as exc:
+        # Hot-apply is best-effort; the config is already persisted and the
+        # new values will take effect for new sessions regardless.
+        logger.warning("providers.update: hot-apply failed: {}", exc)
 
     return {"result": {"saved": True, "provider_name": provider_name}}
 
@@ -389,7 +473,7 @@ _BUILTIN_PROVIDERS = {"deepseek"}
 
 # Encrypted API key for DeepSeek internal testing.
 # Token generated via Fernet with activation-code-derived key.
-_BUILTIN_KEYS: dict[str, str] = {"deepseek": "gAAAAABqcAKIbwGAo4su3S7LbqrXcazQI39QTE-Flr5B_NF8jo2feHUT4tMy7KK0C-Ieh7waUArthTYrBqcSvSNVsGZIPUFV9yFugT7_Lp_eHeTjL53VXi2drCLQ8_019316D__pjnMl"}  # provider_name → encrypted_key
+_BUILTIN_KEYS: dict[str, str] = {"deepseek": "gAAAAABqmSpZGjsRS0YDYm8ZvtPLtFG1sQOtIbT3TsKBn9WQP_YkHqmr3x2-Wx16sq9VR84jmmmguoBx-mqIPTN9uOmpdyY2vees1-bhE54fvxFZyrXEkGkyUbIP-LwxuFA_v6vWJw8V"}  # provider_name → encrypted_key
 
 # Default activation code — the company name / internal code
 _DEFAULT_ACTIVATION_CODE = "weiguanjiyuan5g"
@@ -397,10 +481,11 @@ _DEFAULT_ACTIVATION_CODE = "weiguanjiyuan5g"
 
 def _get_fernet() -> Any:
     """Get Fernet instance for the built-in key encryption."""
-    from cryptography.fernet import Fernet
     # Derive a Fernet key from the activation code (for MVP)
     import base64
     import hashlib
+
+    from cryptography.fernet import Fernet
     digest = hashlib.sha256(_DEFAULT_ACTIVATION_CODE.encode()).digest()
     key = base64.urlsafe_b64encode(digest)
     return Fernet(key)
@@ -432,7 +517,7 @@ async def providers_activate_handler(
     actual key — only the activation status.
     """
     from miqi.config.loader import save_config
-    from miqi.config.schema import ProviderConfig, ProvidersConfig
+    from miqi.config.schema import ProviderConfig
 
     provider_name = params.get("provider_name", "").strip()
     activation_code = params.get("activation_code", "").strip()
@@ -467,9 +552,13 @@ async def providers_activate_handler(
             f"Provider config not found: {provider_name}", code="NOT_FOUND",
         )
 
-    # Write the decrypted key to provider config
+    # Write the decrypted key to provider config. Also clear any legacy
+    # custom api_base / extra_headers: the builtin enterprise key must only
+    # ever go to the official endpoint (#929 review).
     current_dict = pc.model_dump(by_alias=False)
     current_dict["api_key"] = api_key
+    current_dict["api_base"] = None
+    current_dict["extra_headers"] = None
     new_pc = ProviderConfig.model_validate(current_dict)
     setattr(config.providers, provider_name, new_pc)
 
@@ -490,6 +579,86 @@ async def providers_activate_handler(
     return {
         "result": {
             "activated": True,
+            "provider_name": provider_name,
+        }
+    }
+
+
+async def providers_deactivate_handler(
+    request_id: str,
+    params: dict[str, Any],
+    client_id: str,
+    session_id: str | None,
+    registry: Any,
+) -> dict[str, Any]:
+    """取消内置 provider 的激活：清空 api_key 并移除 activation 标记（#835 收口）。"""
+    from miqi.config.loader import save_config
+    from miqi.config.schema import ProviderConfig
+
+    provider_name = params.get("provider_name", "").strip()
+
+    if not provider_name:
+        raise AppServerError("provider_name is required", code="INVALID_PARAMS")
+    if provider_name not in _BUILTIN_PROVIDERS:
+        raise AppServerError(
+            f"Provider '{provider_name}' does not support built-in deactivation",
+            code="NOT_SUPPORTED",
+        )
+
+    state = get_bridge_state(registry)
+    config = state.load_config()
+    pc = getattr(config.providers, provider_name, None)
+    if pc is None:
+        raise AppServerError(
+            f"Provider config not found: {provider_name}", code="NOT_FOUND",
+        )
+
+    # 只有带内置激活标记的配置才允许取消：历史遗留的自配 key 没有标记，
+    # 误调用会把用户自己的 key 清掉（CodeRabbit #929）。
+    builtin_marked = config.is_builtin_activated(provider_name)
+    if not builtin_marked:
+        raise AppServerError(
+            f"Provider '{provider_name}' has no built-in activation to deactivate",
+            code="NOT_ACTIVATED",
+        )
+
+    # Clear the built-in key (and any legacy endpoint overrides — the same
+    # exfiltration vector activation now sanitizes, #929 review)
+    current_dict = pc.model_dump(by_alias=False)
+    current_dict["api_key"] = ""
+    current_dict["api_base"] = None
+    current_dict["extra_headers"] = None
+    new_pc = ProviderConfig.model_validate(current_dict)
+    setattr(config.providers, provider_name, new_pc)
+
+    # Remove the activation marker
+    activation_store = _provider_activation_store(config)
+    activation_store.pop(provider_name, None)
+
+    # 默认模型若属于被取消激活的 provider，重置为一个运行时真正可用的
+    # 模型（优先其他已配置 provider 的测试模型），否则新会话全部
+    # NO_API_KEY 且 UI 与配置不一致（#929 review / #933 review）。
+    from miqi.providers.registry import find_by_model
+
+    current_model = config.agents.defaults.model
+    matched_spec = find_by_model(current_model)
+    if matched_spec is not None and matched_spec.name == provider_name:
+        config.agents.defaults.model = _pick_usable_default_model(config, exclude=provider_name)
+        logger.info(
+            "providers.deactivate: default model '{}' owned by {} — reset to '{}'",
+            current_model, provider_name, config.agents.defaults.model,
+        )
+
+    save_config(config)
+    state.config = config
+
+    logger.info(
+        "providers.deactivate: provider={} deactivated", provider_name,
+    )
+
+    return {
+        "result": {
+            "deactivated": True,
             "provider_name": provider_name,
         }
     }

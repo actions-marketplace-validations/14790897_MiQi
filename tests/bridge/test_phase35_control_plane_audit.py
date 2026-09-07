@@ -15,7 +15,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_methods_dict(file_path: Path) -> dict[str, Any]:
@@ -245,7 +244,7 @@ def test_phase35_baseline_asyncio_run_in_bridge():
 
     # bridge/loop.py should NOT use asyncio.run() — it IS the persistent loop
     assert not loop_runs, (
-        f"bridge/loop.py must not use asyncio.run() — it IS the persistent loop"
+        "bridge/loop.py must not use asyncio.run() — it IS the persistent loop"
     )
 
 
@@ -320,8 +319,8 @@ def test_phase35_runtime_bridge_state_imports_audit():
     )
 
     total_imports = sum(imports.values())
-    assert total_imports == 15, (
-        f"Expected 15 total bridge.server imports in runtime/, "
+    assert total_imports == 16, (
+        f"Expected 16 total bridge.server imports in runtime/, "
         f"got {total_imports}. Update this test if the count changed."
     )
 

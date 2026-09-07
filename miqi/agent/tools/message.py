@@ -42,7 +42,14 @@ class MessageTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Send a message to the user. Use this when you want to communicate something."
+        return (
+            "Send a chat message to the user (optionally with file attachments). "
+            "This is for chatting/notifying only — it is NOT an upload API for any "
+            "cloud platform or website. To upload a file or plan to an external "
+            "platform (e.g. the MiQroForge platform), use that platform's "
+            "dedicated upload interface (the qraft-workflowspec-export skill's "
+            "upload_run.py dataUpload), never this tool."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -64,7 +71,10 @@ class MessageTool(Tool):
                 "media": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional: list of file paths to attach (images, audio, documents)"
+                    "description": (
+                        "Optional: file paths to send as CHAT attachments only. "
+                        "Attachments go to the chat, not to any platform — this is not an upload."
+                    )
                 }
             },
             "required": ["content"]
@@ -84,10 +94,10 @@ class MessageTool(Tool):
         message_id = message_id or self._default_message_id
 
         if not channel or not chat_id:
-            return "Error: No target channel/chat specified"
+            return "Error: 未指定目标 channel/chat"
 
         if not self._send_callback:
-            return "Error: Message sending not configured"
+            return "Error: 消息发送未配置"
 
         msg = OutboundMessage(
             channel=channel,

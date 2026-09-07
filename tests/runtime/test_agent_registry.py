@@ -1,8 +1,6 @@
 """Tests for miqi.runtime.agent_registry."""
 
-import json
 import pytest
-from pathlib import Path
 
 from miqi.runtime.agent_registry import AgentMetadata, AgentRegistry
 
@@ -24,7 +22,7 @@ def test_registry_register_and_resolve():
     registry = AgentRegistry()
     meta = registry.resolve("main")
     assert meta.name == "main"
-    assert meta.display_name == "MiQi"
+    assert meta.display_name == "MiQroForge"
 
 
 def test_discover_plugin_agents_parses_frontmatter(tmp_path):
@@ -89,6 +87,17 @@ def test_registry_has_builtins():
     assert "code-agent" in names
     assert "doc-agent" in names
     assert "research-agent" in names
+
+
+def test_main_agent_prompt_guides_skill_discovery():
+    """The main agent's system prompt must instruct the model to check the
+    Local Skills list and load matching SKILL.md before denying a capability
+    (#613 follow-up)."""
+    registry = AgentRegistry()
+    main_agent = registry.resolve("main")
+    assert "Local Skills" in main_agent.system_prompt
+    assert "skill_manage" in main_agent.system_prompt
+    assert "Never claim a skill does not exist" in main_agent.system_prompt
 
 
 def test_registry_register_duplicate_raises():

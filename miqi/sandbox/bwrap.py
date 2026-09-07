@@ -8,7 +8,7 @@ Each conversation gets its own mount namespace with:
 - A writable overlay (tmpfs) for /tmp, /home/miqi/workspace
 - Read-only bind mounts for /usr, /lib, /bin, etc.
 - A per-session home directory with its own copy of the workspace
-- Network isolation (unshare-net) by default
+- Network shared with host by default (unshare-net only when share_net=False)
 - PID namespace isolation (unshare-pid)
 
 Usage:
@@ -36,16 +36,18 @@ from __future__ import annotations
 # pylint: disable=no-member,import-error
 # Linux-specific APIs (os.killpg, signal.SIGKILL, os.getpgid) and
 # loguru are only available on the target platform / in the WSL venv.
-
 import asyncio
 import os
 import platform
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
 
 from loguru import logger
 
@@ -59,8 +61,21 @@ class BwrapSandboxError(Exception):
 _auto_install_cache: dict[str, bool] = {}
 """Cache auto-install results per distro to avoid repeated apt-get calls."""
 
-import threading
 _install_lock = threading.Lock()
+
+#: Tail-bounded accumulation for :meth:`BwrapSandbox._run_linux_command`.
+#: A texlive-scale distro install can emit tens of MB of dpkg progress
+#: text; the agent never needs more than the tail (the failure message is
+#: at the end).  Keep only the trailing chunk so memory and the agent's
+#: context stay bounded (CodeRabbit review #820).
+_MAX_COMMAND_OUTPUT_CHARS = 1_000_000
+
+#: Max time to wait for the distro-wide install lock before giving up,
+#: consistent with :meth:`_ensure_wsl_deps`' bounded wait (180 s).  Two
+#: parallel installs normally finish within it; beyond that something is
+#: stuck, and the agent gets a clear error instead of a silent hang that
+#: would otherwise last until the outer install timeout (CodeRabbit #820).
+_INSTALL_LOCK_WAIT_TIMEOUT = 180.0
 
 #: WSL distro readiness probe: bwrap + python3/pip toolchain.
 #:
@@ -90,6 +105,27 @@ apt-get processes race on the dpkg lock and one fails.  This lock
 makes the second caller wait for the first install, then re-check with
 a quick readiness probe that succeeds immediately.
 """
+
+#: Idempotent check that the distro's WSL default user is root. Prints
+#: ``ROOT_OK`` when /etc/wsl.conf already declares ``default=root``, or
+#: ``ROOT_FIXED`` after correcting it (so the caller knows to terminate
+#: the distro to apply the change). Run as root (``-u root``) so it has
+#: write access to /etc/wsl.conf regardless of the current default user.
+_WSL_ENSURE_ROOT_CMD = (
+    "if [ \"$(id -un)\" != \"root\" ]; then echo NOT_ROOT; exit 1; fi; "
+    "if grep -qF 'default=root' /etc/wsl.conf 2>/dev/null; then "
+    "echo ROOT_OK; "
+    "else "
+    "if grep -qF 'default=' /etc/wsl.conf 2>/dev/null; then "
+    "sed -i 's/^default=.*/default=root/' /etc/wsl.conf; "
+    "elif grep -qF '[user]' /etc/wsl.conf 2>/dev/null; then "
+    "sed -i '/^\\[user\\]/a default=root' /etc/wsl.conf; "
+    "else "
+    "printf '\\n[user]\\ndefault=root\\n' >> /etc/wsl.conf; "
+    "fi; "
+    "echo ROOT_FIXED; "
+    "fi"
+)
 
 
 class BwrapCommandHandle:
@@ -148,6 +184,11 @@ class BwrapCommandHandle:
     async def kill(self) -> None:
         """Kill the running command.
 
+        No-op when the process has already exited and been reaped: killing
+        the stale process group is both pointless and dangerous — its pgid
+        (the group-leader pid) may have been recycled for an unrelated
+        process group, and `killpg` would signal innocent processes (#472).
+
         On native Linux, tries SIGTERM then SIGKILL against the process group
         (bwrap creates a PID namespace but the outer bwrap process itself is
         in the process group created with ``start_new_session=True``).
@@ -158,6 +199,8 @@ class BwrapCommandHandle:
 
         After calling this, call :meth:`cleanup` to release temporary resources.
         """
+        if self._process.returncode is not None:
+            return
         if self._pgid is not None:
             # Native Linux — kill the process group (bwrap + children)
             try:
@@ -255,7 +298,7 @@ class BwrapSandbox:
         session_key: str,
         workspace: Path | str,
         sandbox_base_dir: Path | str | None = None,
-        share_net: bool = False,
+        share_net: bool = True,
         extra_ro_binds: list[str] | None = None,
         extra_rw_binds: list[str] | None = None,
         hostname: str = "miqi-sandbox",
@@ -349,17 +392,62 @@ class BwrapSandbox:
         self,
         cmd: str,
         timeout: float = 30.0,
+        as_root: bool = False,
+        on_output: Optional[Callable[[str, str], Awaitable[None]]] = None,
     ) -> tuple[int, str, str]:
         """Run a shell command inside the Linux environment.
 
         On Windows, runs via ``wsl.exe -d <distro> -- bash -c "..."``.
         On Linux, runs via ``bash -c "..."``.
+
+        ``as_root=True`` (Windows/WSL only) adds ``-u root`` to the wsl.exe
+        invocation so the command runs as the distro's root user — used for
+        system package installs that persist in the distro and become
+        visible inside every bwrap sandbox via its ro-bind of the distro's
+        system directories (#759).  Native Linux does not have a rootful
+        distro layer; callers must check :attr:`supports_system_installs`
+        first.
+
+        ``on_output``, when given, is awaited with ``(text, stream_name)``
+        for every read chunk (``stream_name`` is "stdout" or "stderr").
+        The install path uses it to emit periodic progress so a long
+        texlive-scale install keeps the chat turn alive (CodeRabbit #820);
+        ``None`` keeps the previous fully-buffered behaviour.  The
+        accumulated output is tail-bounded to
+        :data:`_MAX_COMMAND_OUTPUT_CHARS` regardless.
         """
         if self._use_wsl:
-            full_args = self._wsl_prefix() + ["bash", "-c", cmd]
+            wsl_args = self._wsl_prefix()
+            if as_root:
+                wsl_args = ["wsl.exe", "-d", self._detected_distro, "-u", "root", "--"] \
+                    if self._detected_distro else \
+                    ["wsl.exe", "-u", "root", "--"]
+            full_args = wsl_args + ["bash", "-c", cmd]
         else:
             full_args = ["bash", "-c", cmd]
 
+        async def _drain(stream: Any, name: str, sink: deque[str]) -> None:
+            """Read *stream* incrementally, keep only the trailing output."""
+            if stream is None:
+                return
+            total = 0
+            try:
+                while True:
+                    chunk = await stream.read(4096)
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", errors="replace")
+                    if on_output is not None:
+                        await on_output(text, name)
+                    sink.append(text)
+                    total += len(text)
+                    while total > _MAX_COMMAND_OUTPUT_CHARS and len(sink) > 1:
+                        total -= len(sink.popleft())
+            except Exception:
+                pass
+
+        out_chunks: deque[str] = deque()
+        err_chunks: deque[str] = deque()
         try:
             process = await _create_subprocess_exec(
                 *full_args,
@@ -367,22 +455,138 @@ class BwrapSandbox:
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        _drain(process.stdout, "stdout", out_chunks),
+                        _drain(process.stderr, "stderr", err_chunks),
+                    ),
+                    timeout=timeout,
                 )
+                # Reap the process: the drains finish at pipe EOF, which
+                # can precede the process actually exiting — returncode
+                # would still be None.  Short wait_for: the exit code is
+                # available almost immediately after EOF.
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
             except asyncio.TimeoutError:
                 process.kill()
                 try:
                     await asyncio.wait_for(process.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
-                return (-1, "", f"Command timed out after {timeout}s")
+                # Keep the tail captured so far: a long-running command
+                # that overruns its budget still leaves the agent the last
+                # diagnostic lines instead of an empty timeout message
+                # (CodeRabbit #820).
+                return (
+                    -1,
+                    "".join(out_chunks),
+                    f"{''.join(err_chunks)}\nCommand timed out after {timeout}s",
+                )
 
-            stdout = stdout_bytes.decode("utf-8", errors="replace")
-            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            stdout = "".join(out_chunks)
+            stderr = "".join(err_chunks)
             return (process.returncode if process.returncode is not None else -1, stdout, stderr)
         except Exception as exc:
             return (-1, "", f"Failed to run command: {exc}")
+
+    @property
+    def supports_system_installs(self) -> bool:
+        """True when package installs can be routed to a rootful WSL distro.
+
+        The bwrap sandbox itself runs unprivileged (uid 1000) against
+        read-only system dirs, so ``apt-get`` etc. can never work inside it
+        (#759).  On Windows the WSL distro the sandbox ro-binds its system
+        dirs from *is* a persistent root-capable layer: installing there
+        once makes the toolchain visible in every sandbox session.  Native
+        Linux has no such layer (the host must not receive root installs
+        from the sandboxed agent), so the capability is WSL-only.
+        """
+        return bool(self._use_wsl and self._detected_distro)
+
+    @property
+    def distro_name(self) -> str:
+        """The WSL distro backing this sandbox (empty when not WSL)."""
+        return self._detected_distro or ""
+
+    async def run_in_distro_root(
+        self,
+        command: str,
+        timeout: float = 1200.0,
+        on_output: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    ) -> tuple[int, str, str]:
+        """Run a command as root in the WSL distro, OUTSIDE the bwrap sandbox.
+
+        Used to install system toolchains (LaTeX, compilers, ...) that the
+        unprivileged read-only sandbox cannot install itself.  Because the
+        sandbox ro-binds the distro's system directories (/usr, /lib, /etc,
+        ...), anything installed here is immediately and persistently
+        available to every sandbox command — no sandbox restart needed.
+
+        Only available on Windows + WSL (:attr:`supports_system_installs`);
+        native Linux returns an error result since there is no rootful
+        distro layer and the host must never receive root installs from the
+        sandboxed agent.
+
+        Concurrent distro-side installs are serialized on
+        :data:`_install_lock` (the same lock the auto-install path uses):
+        two parallel ``apt-get`` runs race on dpkg's lock and one fails
+        with "Could not get lock /var/lib/dpkg/lock" (review #759 N3).  The
+        wait polls the non-blocking acquire on the event loop — same
+        strategy as :meth:`_ensure_wsl_deps` — so a queued install neither
+        blocks the loop nor parks a default-executor thread for the whole
+        wait (CodeRabbit review #820).
+
+        ``on_output`` is forwarded to :meth:`_run_linux_command` — the
+        install path streams chunk callbacks through it so a long install
+        can emit periodic progress and keep the chat turn alive.
+
+        Returns:
+            (exit_code, stdout, stderr) — output is tail-bounded to
+            :data:`_MAX_COMMAND_OUTPUT_CHARS`.
+        """
+        if not self.supports_system_installs:
+            return (
+                -1,
+                "",
+                "System package installs require Windows + WSL (the sandbox's "
+                "WSL distro). Not supported on native Linux.",
+            )
+
+        # Non-interactive frontend so apt/dnf never hang on a TTY prompt.
+        full_cmd = f"export DEBIAN_FRONTEND=noninteractive; {command}"
+
+        # threading.Lock (distro-wide, shared with the auto-install path) —
+        # polled without blocking the event loop and without parking a
+        # default-executor thread for the whole wait (which is shared with
+        # workspace snapshots and approval checks).  The wait is bounded by
+        # real elapsed time, like _ensure_wsl_deps' — a stuck holder
+        # (crashed apt-get) surfaces as a clear error instead of a silent
+        # hang until the outer install timeout — and emits progress so the
+        # agent knows the install is queued, not stalled (CodeRabbit #820).
+        deadline = time.monotonic() + _INSTALL_LOCK_WAIT_TIMEOUT
+        while not _install_lock.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                return (
+                    -1,
+                    "",
+                    "Timed out waiting for the distro install lock "
+                    "(another install is still running)",
+                )
+            await asyncio.sleep(1.0)
+            if on_output is not None:
+                await on_output(
+                    "[system install] 等待其他安装完成（distro 锁）……\n",
+                    "stdout",
+                )
+        try:
+            return await self._run_linux_command(
+                full_cmd, timeout=timeout, as_root=True, on_output=on_output,
+            )
+        finally:
+            _install_lock.release()
 
     async def _write_wsl_file_via_stdin(
         self,
@@ -589,6 +793,60 @@ class BwrapSandbox:
         except (asyncio.TimeoutError, OSError, ValueError):
             return None
     @staticmethod
+    async def _ensure_root_default_user(distro: str) -> bool:
+        """Ensure the distro's WSL default user is root (idempotent).
+
+        miqi's sandbox relies on the distro running as root so apt-get
+        and bwrap never hit a sudo password prompt. The distro's
+        /etc/wsl.conf may have been edited externally (or the distro
+        created outside miqi) to a non-root default user, which breaks
+        that assumption and makes every sandbox invocation stall on a
+        password. This corrects it and terminates the distro so the
+        change takes effect.
+
+        Returns True if a change was made (default user flipped to
+        root), False if it was already root or could not be verified.
+        """
+        try:
+            proc = await _create_subprocess_exec(
+                "wsl.exe", "-d", distro, "-u", "root", "--",
+                "bash", "-c", _WSL_ENSURE_ROOT_CMD,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_data, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=15.0,
+            )
+        except (asyncio.TimeoutError, OSError):
+            return False
+
+        output = stdout_data.decode("utf-8", errors="replace") if stdout_data else ""
+        if proc.returncode != 0:
+            logger.warning(
+                "Failed to ensure root default user for '{}': {}",
+                distro, output.strip()[:200],
+            )
+            return False
+
+        if "ROOT_FIXED" not in output:
+            return False  # ROOT_OK (already root) or no action needed
+
+        # Terminate so wsl.conf takes effect on the next launch
+        try:
+            term = await _create_subprocess_exec(
+                "wsl.exe", "--terminate", distro,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(term.communicate(), timeout=10.0)
+        except (asyncio.TimeoutError, OSError):
+            pass
+        logger.info(
+            "Sandbox distro '{}' default user set to root", distro,
+        )
+        return True
+
+    @staticmethod
     async def _ensure_sandbox_distro(target_name: str = "AIShadowSandbox") -> bool:
         """Create a dedicated sandbox WSL distro if it does not exist.
 
@@ -612,6 +870,11 @@ class BwrapSandbox:
                 logger.info(
                     "Sandbox distro '{}' already exists", target_name,
                 )
+                # The distro may exist but with a non-root default user
+                # (e.g. /etc/wsl.conf edited externally), which would
+                # make apt-get/bwrap stall on a sudo password prompt.
+                # Enforce root even on the already-exists path.
+                await BwrapSandbox._ensure_root_default_user(target_name)
                 return True
         except (asyncio.TimeoutError, OSError):
             pass
@@ -688,29 +951,11 @@ class BwrapSandbox:
                 )
                 return False
 
-            # Set default user to root so apt-get never needs a password
-            try:
-                set_root = await _create_subprocess_exec(
-                    "wsl.exe", "-d", target_name, "-u", "root", "--",
-                    "bash", "-c",
-                    "echo -e '[user]\\ndefault=root' > /etc/wsl.conf",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(
-                    set_root.communicate(), timeout=10.0,
-                )
-                # Terminate so wsl.conf takes effect on next launch
-                term = await _create_subprocess_exec(
-                    "wsl.exe", "--terminate", target_name,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.wait_for(
-                    term.communicate(), timeout=10.0,
-                )
-            except (asyncio.TimeoutError, OSError):
-                pass  # best-effort, not fatal
+            # Set default user to root so apt-get never needs a password.
+            # Reuse the idempotent helper so the just-imported distro's
+            # wsl.conf is normalized the same way as the already-exists
+            # path above (keeps any extra [boot]/[network] sections intact).
+            await BwrapSandbox._ensure_root_default_user(target_name)
 
             logger.info(
                 "Sandbox distro '{}' created (installed at {})",
@@ -732,9 +977,23 @@ class BwrapSandbox:
                     pass
 
     @staticmethod
+    def _is_transient_apt_error(msg: str) -> bool:
+        """apt 网络瞬断类错误（重试一次可恢复）；非瞬断错误立即失败。"""
+        low = msg.lower()
+        return any(
+            key in low
+            for key in (
+                "temporary failure resolving",
+                "could not resolve",
+                "connection timed out",
+                "network is unreachable",
+                "connection refused",
+            )
+        )
+
+    @staticmethod
     async def _ensure_wsl_deps(distro: str) -> bool:
         """Install required packages in a WSL distro and verify bwrap + Python.
-
         Installs: bubblewrap, coreutils, rsync, python3, python3-pip,
         python3-venv, unzip.
 
@@ -881,56 +1140,66 @@ class BwrapSandbox:
             if use_sudo:
                 install_cmd = f"sudo bash -c '{install_cmd}'"
 
-            try:
-                proc = await _create_subprocess_exec(
-                    "wsl.exe", "-d", distro, "--", "bash", "-c",
-                    install_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
+            # WSL/runner 网络偶发瞬断（Temporary failure resolving）会让
+            # 安装失败——瞬断类错误重试一次，非瞬断错误立即失败。
+            for _attempt in range(2):
                 try:
-                    _stdout, stderr = await asyncio.wait_for(
-                        proc.communicate(), timeout=180.0,
+                    proc = await _create_subprocess_exec(
+                        "wsl.exe", "-d", distro, "--", "bash", "-c",
+                        install_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
-                except asyncio.TimeoutError:
-                    # Kill the wsl.exe wrapper before releasing the lock —
-                    # an orphaned apt-get would keep holding the dpkg lock
-                    # and deadlock the next installer.
                     try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
-                    except (asyncio.TimeoutError, ProcessLookupError, OSError):
-                        pass
-                    raise
-                stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
-
-                if proc.returncode != 0:
-                    logger.info(
-                        "  apt-get install completed in {:.0f}s (failed)",
-                        time.monotonic() - _t0,
-                    )
-                    err_msg = stderr[:300] or "unknown error"
-                    if not use_sudo and (
-                        "permission denied" in err_msg.lower()
-                        or "are you root" in err_msg.lower()
-                    ):
-                        err_msg += (
-                            " (sudo is required but needs a password. "
-                            "Configure passwordless sudo in the WSL distro "
-                            "or run: wsl -d {0} -- sudo apt-get install "
-                            "bubblewrap python3 python3-pip)".format(distro)
+                        _stdout, stderr = await asyncio.wait_for(
+                            proc.communicate(), timeout=180.0,
                         )
+                    except asyncio.TimeoutError:
+                        # Kill the wsl.exe wrapper before releasing the lock —
+                        # an orphaned apt-get would keep holding the dpkg lock
+                        # and deadlock the next installer.
+                        try:
+                            proc.kill()
+                            await asyncio.wait_for(proc.wait(), timeout=5.0)
+                        except (asyncio.TimeoutError, ProcessLookupError, OSError):
+                            pass
+                        raise
+                    stderr = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+                    if proc.returncode != 0:
+                        logger.info(
+                            "  apt-get install completed in {:.0f}s (failed, attempt {})",
+                            time.monotonic() - _t0, _attempt + 1,
+                        )
+                        err_msg = stderr[:300] or "unknown error"
+                        if not use_sudo and (
+                            "permission denied" in err_msg.lower()
+                            or "are you root" in err_msg.lower()
+                        ):
+                            err_msg += (
+                                " (sudo is required but needs a password. "
+                                "Configure passwordless sudo in the WSL distro "
+                                "or run: wsl -d {0} -- sudo apt-get install "
+                                "bubblewrap python3 python3-pip)".format(distro)
+                            )
+                        if _attempt == 0 and BwrapSandbox._is_transient_apt_error(err_msg):
+                            logger.warning(
+                                "apt install failed with transient network error, retrying once: {}",
+                                err_msg,
+                            )
+                            continue
+                        logger.warning(
+                            "Failed to install dependencies in WSL distro "
+                            "'{}': {}", distro, err_msg,
+                        )
+                        return False
+                    break
+                except (asyncio.TimeoutError, OSError) as exc:
                     logger.warning(
-                        "Failed to install dependencies in WSL distro "
-                        "'{}': {}", distro, err_msg,
+                        "Failed to run apt install in WSL distro '{}': {}",
+                        distro, exc,
                     )
                     return False
-            except (asyncio.TimeoutError, OSError) as exc:
-                logger.warning(
-                    "Failed to run apt install in WSL distro '{}': {}",
-                    distro, exc,
-                )
-                return False
         finally:
             _install_lock.release()
 
@@ -1080,28 +1349,26 @@ class BwrapSandbox:
         """Stop any running bwrap process and clean up sandbox directories."""
         self._running = False
 
-        # Clean up any streaming handles not manually cleaned up
+        # Kill any streaming commands still running, then release their temp
+        # resources.  Previously this only called cleanup() (script-file
+        # removal), leaving the wsl.exe → bash → bwrap process chain alive
+        # when a long-running command was in flight — the real source of
+        # orphan WSL processes after stop() (#472).
         for handle in getattr(self, '_streaming_handles', []):
+            try:
+                await handle.kill()
+            except Exception:
+                pass
             try:
                 await handle.cleanup()
             except Exception:
                 pass
         self._streaming_handles = []
 
-        # Kill any running process
-        if self._process and self._process.returncode is None:
-            try:
-                self._process.kill()
-                await asyncio.wait_for(self._process.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                pass
-            self._process = None
-
-        # Clean up sandbox filesystem inside Linux/WSL
-        rc, _, err = await self._run_linux_command(
-            f"rm -rf '{self._linux_base_dir}'"
-        )
-        if rc == 0:
+        # Clean up sandbox filesystem inside Linux/WSL — retry + verify the
+        # directory is actually gone so failures surface instead of silently
+        # leaking disk (#472).
+        if await BwrapSandbox._rm_rf_retry(self._linux_base_dir, self._detected_distro):
             logger.info("Sandbox cleaned up: {}", self._linux_base_dir)
             append_workspace_log(
                 self._log_workspace,
@@ -1110,10 +1377,10 @@ class BwrapSandbox:
                 source="sandbox",
             )
         else:
-            logger.warning("Failed to clean sandbox {}: {}", self._linux_base_dir, err)
+            logger.warning("Failed to clean sandbox {}", self._linux_base_dir)
             append_workspace_log(
                 self._log_workspace,
-                f"Sandbox cleanup failed session={self.session_key} error={err}",
+                f"Sandbox cleanup failed session={self.session_key} path={self._linux_base_dir}",
                 level="WARNING",
                 source="sandbox",
             )
@@ -1496,7 +1763,13 @@ class BwrapSandbox:
         args.extend(["--hostname", self.hostname])
 
         # ── UID/GID (requires --unshare-user) ──────────────────────
-        args.append("--unshare-user-try")
+        # Hard --unshare-user, NOT --unshare-user-try: the -try variant
+        # silently skips user-namespace isolation when the kernel refuses
+        # (Docker containers, restricted kernels) while PID/net/ipc/uts stay
+        # hard — an inconsistent, silent security downgrade (#81).  With the
+        # hard flag bwrap fails loudly (stderr surfaces the error), so the
+        # user knows the sandbox is not fully isolated.
+        args.append("--unshare-user")
         args.extend(["--uid", str(self.uid)])
         args.extend(["--gid", str(self.gid)])
 
@@ -1703,7 +1976,96 @@ class BwrapSandbox:
             return await BwrapSandbox._find_bwrap_native() is not None
 
     @staticmethod
-    async def cleanup_dir(linux_dir: str, wsl_distro: str = "") -> None:
+    async def _communicate_or_kill(
+        proc: asyncio.subprocess.Process, timeout: float = 15.0
+    ) -> bytes:
+        """``communicate()`` with a timeout; on timeout kill + await the process.
+
+        A timed-out ``rm``/``test`` subprocess would otherwise keep running as
+        an orphaned WSL wrapper — exactly what this PR is meant to eliminate.
+        """
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return stderr
+        except asyncio.TimeoutError:
+            logger.warning("Sandbox subprocess timed out — killing it")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            raise
+
+    @staticmethod
+    async def _rm_rf_retry(linux_dir: str, wsl_distro: str = "") -> bool:
+        """Remove a directory tree with retries and post-delete verification.
+
+        ``rm -rf`` can fail transiently in WSL (file locks, slow tmpfs, the
+        WSL server momentarily restarting); retry with exponential backoff
+        (0.5s/1s/2s, 3 attempts) and confirm the path is actually gone before
+        reporting success.  Paths are passed as argv (never through a shell),
+        so there is no quoting-injection surface (#472).
+        """
+        if _is_windows():
+            distro = wsl_distro
+            if not distro:
+                distro = await BwrapSandbox._detect_wsl_distro() or ""
+            if not distro:
+                logger.warning("No WSL distro available for cleanup of {}", linux_dir)
+                return False
+            prefix = ["wsl.exe", "-d", distro, "--"]
+        else:
+            prefix = []
+
+        for attempt in range(3):
+            try:
+                proc = await _create_subprocess_exec(
+                    *prefix, "rm", "-rf", linux_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stderr_bytes = await BwrapSandbox._communicate_or_kill(proc)
+                if proc.returncode != 0:
+                    logger.warning(
+                        "rm -rf {} failed (attempt {}/3): {}",
+                        linux_dir, attempt + 1,
+                        stderr_bytes.decode("utf-8", errors="replace").strip(),
+                    )
+                else:
+                    # Verify the path is actually gone — test -e returns 0 if it
+                    # still exists, so success means "removed".
+                    check = await _create_subprocess_exec(
+                        *prefix, "test", "-e", linux_dir,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await BwrapSandbox._communicate_or_kill(check)
+                    if check.returncode != 0:
+                        return True
+                    logger.warning(
+                        "rm -rf {} reported success but path still exists (attempt {}/3)",
+                        linux_dir, attempt + 1,
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "rm -rf {} timed out (attempt {}/3)", linux_dir, attempt + 1
+                )
+            except Exception as exc:
+                logger.warning(
+                    "rm -rf {} failed (attempt {}/3): {}", linux_dir, attempt + 1, exc
+                )
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+        logger.warning("Failed to remove {} after 3 attempts", linux_dir)
+        return False
+
+    @staticmethod
+    async def cleanup_dir(
+        linux_dir: str, wsl_distro: str = "", expected_root: str = ""
+    ) -> bool:
         """Remove a sandbox directory from the Linux/WSL filesystem.
 
         This is used by SandboxManager to clean up stale sandboxes from
@@ -1712,49 +2074,41 @@ class BwrapSandbox:
         Args:
             linux_dir: Absolute path inside Linux/WSL to remove.
             wsl_distro: WSL distribution name (auto-detect if empty).
+            expected_root: The configured sandbox root (native ``sandbox_base_dir``
+                or WSL ``wsl_base_dir``).  When provided, ``linux_dir`` must be
+                at or below this root (boundary-safe); when empty, the legacy
+                fixed-prefix guard is applied instead.
+
+        Returns:
+            True if the directory is gone, False if cleanup failed.
         """
         if not linux_dir or not linux_dir.startswith("/"):
             logger.warning("Refusing to cleanup non-absolute path: {}", linux_dir)
-            return
+            return False
 
-        # Safety: only allow paths under known sandbox prefixes
-        _ALLOWED_PREFIXES = ("/tmp/miqi-sandboxes/", "/tmp/miqi-sandbox")
-        if not any(linux_dir.startswith(p) for p in _ALLOWED_PREFIXES):
-            logger.warning(
-                "Refusing to cleanup path outside allowed prefixes: {}", linux_dir
-            )
-            return
-
-        if _is_windows():
-            # Run via WSL
-            distro = wsl_distro
-            if not distro:
-                distro = await BwrapSandbox._detect_wsl_distro() or ""
-            if not distro:
-                logger.warning("No WSL distro available for cleanup of {}", linux_dir)
-                return
-            prefix = ["wsl.exe", "-d", distro, "--"]
-        else:
-            prefix = []
-
-        try:
-            process = await _create_subprocess_exec(
-                *prefix, "rm", "-rf", linux_dir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=15.0
-            )
-            if process.returncode == 0:
-                logger.debug("Cleaned up directory: {}", linux_dir)
-            else:
-                stderr = stderr_bytes.decode("utf-8", errors="replace")
+        if expected_root:
+            root = expected_root.rstrip("/")
+            if not (linux_dir == root or linux_dir.startswith(root + "/")):
                 logger.warning(
-                    "Failed to cleanup {}: {}", linux_dir, stderr.strip()
+                    "Refusing to cleanup path outside expected root {}: {}",
+                    root, linux_dir,
                 )
-        except Exception as exc:
-            logger.warning("Failed to cleanup {}: {}", linux_dir, exc)
+                return False
+        else:
+            # Legacy guard — only allow paths under known sandbox prefixes
+            allowed_prefixes = ("/tmp/miqi-sandboxes/", "/tmp/miqi-sandbox")
+            if not any(linux_dir.startswith(p) for p in allowed_prefixes):
+                logger.warning(
+                    "Refusing to cleanup path outside allowed prefixes: {}", linux_dir
+                )
+                return False
+
+        ok = await BwrapSandbox._rm_rf_retry(linux_dir, wsl_distro)
+        if ok:
+            logger.debug("Cleaned up directory: {}", linux_dir)
+        else:
+            logger.warning("Failed to cleanup {} after retries", linux_dir)
+        return ok
 
     @property
     def is_running(self) -> bool:

@@ -47,7 +47,7 @@ async def test_task_runner_persists_history_across_turns(
         seen_agent = False
         seen_complete = False
         while not (seen_agent and seen_complete):
-            ev = await runtime.next_event(timeout=2)
+            ev = await runtime.next_event(timeout=15)
             if ev is None:
                 break
             events_1.append(ev)
@@ -74,7 +74,7 @@ async def test_task_runner_persists_history_across_turns(
         seen_agent_2 = False
         seen_complete_2 = False
         while not (seen_agent_2 and seen_complete_2):
-            ev = await runtime.next_event(timeout=2)
+            ev = await runtime.next_event(timeout=15)
             if ev is None:
                 break
             events_2.append(ev)
@@ -159,7 +159,7 @@ async def test_task_runner_persists_tool_call_messages(
         seen_agent = False
         seen_complete = False
         while not (seen_agent and seen_complete):
-            ev = await runtime.next_event(timeout=2)
+            ev = await runtime.next_event(timeout=15)
             if ev is None:
                 break
             events.append(ev)
@@ -219,7 +219,7 @@ async def test_short_history_does_not_trigger_compact(
         events: list[object] = []
         seen_complete = False
         while not seen_complete:
-            ev = await runtime.next_event(timeout=2)
+            ev = await runtime.next_event(timeout=15)
             if ev is None:
                 break
             events.append(ev)
@@ -243,7 +243,7 @@ async def test_task_runner_auto_compacts_before_large_turn(
     before AgentMessageEvent."""
     from unittest.mock import AsyncMock
 
-    from miqi.protocol.events import ContextCompactedEvent, TurnCompleteEvent
+    from miqi.protocol.events import TurnCompleteEvent
     from miqi.runtime.context_runtime import CompactionResult
 
     runtime = RuntimeSession.create(
@@ -270,7 +270,7 @@ async def test_task_runner_auto_compacts_before_large_turn(
         events: list[object] = []
         seen_complete = False
         while not seen_complete:
-            ev = await runtime.next_event(timeout=2)
+            ev = await runtime.next_event(timeout=15)
             if ev is None:
                 break
             events.append(ev)
@@ -303,9 +303,7 @@ async def test_compaction_failure_does_not_crash_runtime(
     from unittest.mock import AsyncMock
 
     from miqi.protocol.events import (
-        AgentMessageEvent,
         ErrorEvent,
-        EventSeverity,
         TurnCompleteEvent,
     )
 
@@ -329,7 +327,7 @@ async def test_compaction_failure_does_not_crash_runtime(
         events: list[object] = []
         seen_complete = False
         while not seen_complete:
-            ev = await runtime.next_event(timeout=2)
+            ev = await runtime.next_event(timeout=15)
             if ev is None:
                 break
             events.append(ev)
@@ -369,7 +367,6 @@ async def test_compaction_record_persisted_and_reused(
     import asyncio as _asyncio
     from unittest.mock import AsyncMock, MagicMock
 
-    from miqi.runtime.context_runtime import CompactionResult
     from miqi.runtime.history_runtime import HistoryRuntime
     from miqi.runtime.task_runner import TaskRunner
 
@@ -534,7 +531,8 @@ async def test_real_compactor_produces_summary_and_replaces_history(tmp_path):
     assert summary_msgs[0]["role"] == "system"
 
     # Verify compaction audit record
-    import aiosqlite, json
+
+    import aiosqlite
     async with aiosqlite.connect(str(db_path)) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(

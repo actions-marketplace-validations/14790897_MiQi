@@ -29,18 +29,346 @@ Usage:
     await manager.destroy("feishu:oc_123")
 """
 
+import asyncio
 import json
 import os
+import shutil
+import sys
 import tempfile
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
-from miqi.sandbox.bwrap import BwrapSandbox, BwrapSandboxError
+from miqi.sandbox.bwrap import BwrapSandbox, BwrapSandboxError, _create_subprocess_exec, _is_windows
+
+
+def sandbox_is_active(sandbox_manager: Any) -> bool:
+    """Whether the WSL/bwrap sandbox is enabled AND initialized right now.
+
+    Mirrors the ``bwrap_available`` computation in RuntimeServices, but
+    reads the LIVE manager attributes — the policy engine's snapshot at
+    build time can be stale after a toggle change mid-session.
+    """
+    return bool(
+        sandbox_manager is not None
+        and sandbox_manager != "disabled"
+        and getattr(sandbox_manager, "enabled", False)
+        and getattr(sandbox_manager, "_initialized", False)
+    )
+
+
+_git_bash_checked = False
+_git_bash_path: str | None = None
+
+_host_python_checked = False
+_host_python_path: str | None = None
+
+
+def _find_host_python() -> str | None:
+    """Find a real Python interpreter on the host, skipping store stubs.
+
+    Packaged (frozen) builds only — there sys.executable is the bridge
+    binary itself, not an interpreter. On Windows the PATH scan must skip
+    %LOCALAPPDATA%\\Microsoft\\WindowsApps\\python.exe: that is a store
+    stub which opens the Microsoft Store and hangs instead of running.
+    Result is cached because the per-turn environment description calls
+    this on every turn.
+    """
+    global _host_python_checked, _host_python_path
+    if _host_python_checked:
+        return _host_python_path
+    _host_python_checked = True
+    if os.name == "nt":
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            if not entry:
+                continue
+            cand = os.path.join(entry, "python.exe")
+            if not os.path.isfile(cand):
+                continue
+            if "windowsapps" in cand.lower():
+                continue
+            _host_python_path = cand
+            break
+    else:
+        _host_python_path = shutil.which("python3") or shutil.which("python")
+    return _host_python_path
+
+
+def _is_cygwin_bash(path: str) -> bool:
+    r"""True when *path* is a Cygwin bash.exe (e.g. C:\cygwin64\bin\bash.exe).
+
+    Cygwin uses /cygdrive/c/... paths, NOT the /c/... convention the
+    environment description promises — selecting it would mislead the AI.
+    """
+    p = str(path).lower().replace("\\", "/")
+    return any(part == "cygwin" or part == "cygwin64" for part in p.split("/"))
+
+
+def _is_windows_system_bash(path: str) -> bool:
+    """True when *path* is the WSL entrypoint (C:\\Windows\\System32\\bash.exe).
+
+    shutil.which("bash") can resolve to System32\\bash.exe on machines with
+    WSL enabled — running that would execute commands inside a Linux distro
+    while the prompt claims Git Bash with /c/ path mappings.
+
+    String-based split (not Path.parts) so the check is independent of the
+    host platform — Path.parts does not treat backslashes as separators on
+    POSIX and would let the WSL entrypoint through on Linux runners.
+    """
+    p = str(path).lower().replace("\\", "/")
+    parts = [x for x in p.split("/") if x]
+    return (
+        len(parts) >= 2
+        and parts[1] == "windows"
+        and len(parts[0]) >= 2
+        and parts[0][1] == ":"
+    )
+
+
+_GIT_BASH_COMMON_LOCATIONS = (
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+)
+
+
+def find_git_bash() -> str | None:
+    """Locate Git Bash (bash.exe) on Windows; None when not installed.
+
+    Without the WSL sandbox, exec runs bash-style commands through Git
+    Bash when available so the AI's bash habits (; chains, ls/find/grep)
+    keep working on Windows.  Result is cached per process.
+
+    Known Git-for-Windows install locations take precedence over PATH:
+    ``shutil.which("bash")`` can resolve to C:\\Windows\\System32\\bash.exe
+    (the WSL entrypoint), which would silently run commands in a Linux
+    distro — that candidate is rejected.
+    """
+    global _git_bash_checked, _git_bash_path
+    if _git_bash_checked:
+        return _git_bash_path
+    _git_bash_checked = True
+    # Debug/acceptance override: force the Windows cmd fallback path
+    # even when Git Bash is installed (e.g. MIQI_FORCE_CMD_EXEC=1).
+    if getattr(os, "environ", {}).get("MIQI_FORCE_CMD_EXEC") == "1":
+        _git_bash_path = None
+        return None
+
+    for base in _GIT_BASH_COMMON_LOCATIONS:
+        if os.path.exists(base):
+            _git_bash_path = base
+            return base
+    local = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\bash.exe")
+    if os.path.exists(local):
+        _git_bash_path = local
+        return local
+    from_path = shutil.which("bash")
+    if (
+        from_path is not None
+        and not _is_windows_system_bash(from_path)
+        and not _is_cygwin_bash(from_path)
+    ):
+        _git_bash_path = from_path
+        return from_path
+    return None
+
+
+def windows_path_to_msys(path: str | Path) -> str:
+    """Convert a Windows path to its MSYS/Git Bash form (C:\\x → /c/x)."""
+    p = str(path).replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        return "/" + p[0].lower() + p[2:]
+    return p
+
+
+def windows_path_to_mnt(path: str | Path) -> str:
+    """Convert a Windows path to its WSL form (C:\\x → /mnt/c/x)."""
+    p = str(path).replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        return "/mnt/" + p[0].lower() + p[2:]
+    return p
+
+
+def _skills_dirs_note(workspace: str | Path | None, style: str) -> str:
+    """One sentence telling the AI how to locate skills.
+
+    The prompt must NOT disclose machine-specific absolute paths for the
+    builtin skills — the app may live anywhere (dev checkout, installed
+    package, extracted archive).  skill_manage(action='view') resolves the
+    runtime location itself and appends the scripts directory, so point the
+    AI there; the workspace skills dir is the only config-derived path worth
+    mentioning (and it is per-user runtime data, not a hard-coded path).
+    """
+    ws_skills = str(Path(workspace) / "skills") if workspace is not None else ""
+
+    if style == "msys":
+        ws_skills = windows_path_to_msys(ws_skills) if ws_skills else ""
+    elif style == "mnt":
+        ws_skills = windows_path_to_mnt(ws_skills) if ws_skills else ""
+
+    parts = []
+    if ws_skills:
+        parts.append(f"工作区技能目录 {ws_skills}")
+    parts.append(
+        "技能内容与内置技能的脚本目录请用 skill_manage(action='view', name=<技能名>) 获取"
+        "（返回内容末尾附脚本目录路径），无需搜索或猜测绝对路径"
+    )
+    return "技能定位：" + "、".join(parts) + "。"
+
+
+def _host_python_note(exe: str, style: str) -> str:
+    if style == "msys":
+        exe = windows_path_to_msys(exe)
+    return (
+        f"推荐 Python 解释器：{exe}。"
+        "运行 python 脚本请直接用这个完整路径，避免 PATH 上其他 "
+        "python 启动卡顿（如商店占位程序）。"
+    )
+
+
+def _python_note(style: str) -> str:
+    """One sentence disclosing the bridge's REAL python interpreter.
+
+    Host-exec paths only — inside the sandbox the host interpreter cannot
+    run (no WSL interop), see _sandbox_python_note instead.  The AI
+    otherwise resolves `python` via PATH and can hit the WindowsApps
+    store stub (hangs ~forever) or a stale interpreter — give it the full
+    path in the exec environment's path style
+    (msys = /c/..., native = as-is).
+    """
+    if getattr(sys, "frozen", False):
+        # Packaged (PyInstaller) build: sys.executable is miqi-bridge.exe
+        # itself, NOT a python interpreter — recommending it would make
+        # the AI launch a second bridge instead of running the script.
+        # The embedded runtime is private to the bridge, so fall back to a
+        # real host interpreter when one exists.
+        host_py = _find_host_python()
+        if host_py:
+            return _host_python_note(host_py, style)
+        return (
+            "本机未检测到可用的独立 Python（打包版自带的运行时仅供 bridge "
+            "内部使用，不能用来执行脚本）。运行 Python 脚本请让用户安装 "
+            "Python 3.11+，或启用沙箱后在沙箱内使用 python3。"
+        )
+    exe = str(getattr(sys, "executable", ""))
+    if not exe:
+        return ""
+    return _host_python_note(exe, style)
+
+
+def _sandbox_python_note(sandbox_manager: Any) -> str:
+    """Tell the AI how to run Python INSIDE the bwrap sandbox.
+
+    The sandbox ro-binds the distro's /usr, so python3 is always present
+    (the WSL readiness probe only passes with python3 + pip available).
+    The host interpreter disclosure (_python_note) is wrong here: bwrap's
+    namespace isolation removes the WSL interop bridge, so Windows .exe
+    files under /mnt/c — including the bridge's own venv python — can
+    never start, and recommending one makes the AI retry a dead path
+    (#822).
+    """
+    if _is_windows():
+        interop = (
+            "沙箱内无 WSL interop：/mnt/c/... 下的 Windows 程序（含 Windows 侧 "
+            "python.exe）无法启动，不要尝试运行。"
+        )
+    else:
+        interop = ""
+    install = (
+        "Python 依赖用 python3 -m pip install --user <包名> 安装（写入沙箱 HOME，"
+        "沙箱销毁后不保留）；pip 报 externally-managed 时改用 "
+        "python3 -m venv ~/.venv && ~/.venv/bin/pip install <包名>。"
+    )
+    if getattr(sandbox_manager, "allow_system_installs", False):
+        install += (
+            "需要长期可用的依赖可直接 sudo apt-get install python3-<包名>"
+            "（随发行版持久化，装完沙箱内立即可用）。"
+        )
+    return (
+        f"沙箱内请使用 python3（发行版自带，只读挂载始终可用）。{interop}{install}"
+    )
+
+
+def describe_exec_environment(
+    sandbox_manager: Any,
+    workspace: str | Path | None = None,
+) -> str:
+    """Human-readable description of where/how exec commands run, for AI prompts.
+
+    Used by the exec tool description and the per-turn session context so
+    the AI is told the ACTUAL environment instead of a hard-coded sandbox
+    story: with the sandbox active exec runs inside WSL with /home/miqi
+    paths; without it exec runs directly on the host — through Git Bash
+    on Windows when available, otherwise Windows cmd.
+    """
+    if sandbox_is_active(sandbox_manager):
+        parts = [
+            (
+                "exec 在 WSL 沙箱中运行——默认工作区下沙箱 /home/miqi/workspace "
+                "与文件工具目录不同（沙箱为独立目录，看不到文件工具写入的文件），"
+                "自定义工作区下二者相同；exec 中访问文件请用主机路径（如 /mnt/c/...），"
+                "或改用文件工具。"
+            )
+        ]
+        # Phase 77 (#759): system package install routing.  Tell the AI the
+        # ACTUAL way to obtain system toolchains (LaTeX, compilers, ...):
+        # inside the sandbox they are unprivileged + system dirs are
+        # read-only, so apt-get can never work there; when enabled, install
+        # commands are routed to the WSL distro as root and persist.
+        if getattr(sandbox_manager, "allow_system_installs", False):
+            parts.append(
+                "系统包安装已开启：需要系统工具链（如 LaTeX/xelatex、编译器）时，"
+                "直接运行 sudo apt-get install -y <包名>（或 apt/dnf/pacman 等），"
+                "该命令会以 root 在 WSL 发行版中执行（仅 Windows + WSL 生效），"
+                "安装一次跨会话持久，装完即可在沙箱内使用。"
+            )
+        else:
+            parts.append(
+                "沙箱内无法安装系统包（tools.sandbox.allow_system_installs 未开启）："
+                "sudo/apt-get install 会被拦截；如需 LaTeX 等系统工具链，"
+                "请让用户在配置中开启该选项。"
+            )
+        return (
+            " ".join(parts)
+            + _skills_dirs_note(workspace, "mnt")
+            + _sandbox_python_note(sandbox_manager)
+        )
+    if os.name == "nt":
+        if find_git_bash() is not None:
+            mapping = ""
+            if workspace is not None:
+                mapping = (
+                    f" 工作区 {workspace} 在 Git Bash 中为 "
+                    f"{windows_path_to_msys(workspace)}。"
+                )
+            return (
+                "exec 通过 Git Bash（bash.exe）在 Windows 本机执行（当前未启用沙箱），"
+                "与文件工具使用同一工作目录；支持 bash 语法与常用命令"
+                "（ls/find/grep/sed 等），用 && 或 ; 连接多条命令；"
+                f"Windows 路径在 Git Bash 中映射为 /c/... 形式（如 C:\\Users\\x 对应 /c/Users/x）。{mapping}"
+                "文件工具（read_file/write_file/list_dir）仍使用 Windows 路径。"
+                + _skills_dirs_note(workspace, "msys") + _python_note("msys")
+            )
+        return (
+            "exec 直接在 Windows cmd 中运行（当前未启用沙箱），"
+            "与文件工具使用同一工作目录，请使用 Windows 路径（如 C:\\Users\\...）。"
+            "cmd 语法注意：用 && 连接多条命令（不支持 ; 分隔），"
+            "ls/find/grep/sed 不可用（用 dir / where / findstr），"
+            "或使用 powershell -Command \"...\"。"
+            "本机未检测到 Git Bash，请只用 cmd 或 powershell 语法；"
+            "不要直接运行 bash/wsl 命令：PATH 上的 bash 可能是 "
+            "System32\\bash.exe（子系统的入口桩），若子系统未启用会报 "
+            "「EXECUTABLE NOT FOUND / 子系统未安装」。"
+            + _skills_dirs_note(workspace, "native") + _python_note("native")
+        )
+    return (
+        "exec 直接在本机 shell（bash）中运行（当前未启用沙箱），"
+        "与文件工具使用同一工作目录，使用标准 Linux/macOS 命令与路径。"
+        + _skills_dirs_note(workspace, "native")
+    )
 
 
 class SandboxManager:
@@ -57,7 +385,7 @@ class SandboxManager:
         self,
         workspace: Path,
         sandbox_base_dir: Path | None = None,
-        share_net: bool = False,
+        share_net: bool = True,
         enabled: bool = True,
         max_sandboxes: int = 10,
         auto_cleanup: bool = True,
@@ -65,6 +393,7 @@ class SandboxManager:
         wsl_base_dir: str = "/tmp/miqi-sandboxes",
         sandbox_distro_name: str = "AIShadowSandbox",
         auto_install_deps: bool = True,
+        allow_system_installs: bool = False,
         session_workspace_resolver: Any = None,
     ):
         self.workspace = workspace
@@ -77,6 +406,11 @@ class SandboxManager:
         self.wsl_base_dir = wsl_base_dir
         self.sandbox_distro_name = sandbox_distro_name
         self.auto_install_deps = auto_install_deps
+        # #759: when enabled, package install commands (apt-get/apt/dnf/...)
+        # are routed to the WSL distro as root so system toolchains install
+        # once and persist across sessions (visible in every sandbox via the
+        # distro's ro-bind system dirs).
+        self.allow_system_installs = allow_system_installs
 
         self._sandboxes: dict[str, BwrapSandbox] = {}
         self._active_key: str | None = None
@@ -160,19 +494,121 @@ class SandboxManager:
         except Exception as exc:
             logger.warning("Failed to save sandbox state: {}", exc)
 
-    def _load_state(self) -> dict[str, Any] | None:
+    @staticmethod
+    def _validate_state(data: Any) -> bool:
+        """Validate the loaded sandbox state schema.
+
+        Requires a top-level dict, a ``sandboxes`` list, and a non-empty
+        ``linux_base_dir`` string on every entry.  A syntactically-valid file
+        with the wrong shape (e.g. ``[]``) is treated as damaged so callers
+        fall back to orphan recovery instead of crashing or skipping cleanup.
+        """
+        if not isinstance(data, dict):
+            return False
+        entries = data.get("sandboxes")
+        if not isinstance(entries, list):
+            return False
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return False
+            base = entry.get("linux_base_dir")
+            if not isinstance(base, str) or not base:
+                return False
+        return True
+
+    def _load_state(self) -> tuple[dict[str, Any] | None, bool]:
         """Read the persisted sandbox state from disk.
 
-        Returns the parsed JSON payload, or None if no valid state file exists.
+        Returns a ``(state, damaged)`` tuple:
+        - ``state``: the parsed JSON payload, or None if no state exists.
+        - ``damaged``: True when a state file exists but could not be parsed
+          (corrupt / truncated / schema-invalid).  Callers should rebuild from
+          a filesystem scan instead of trusting the file (#472).
         """
         if not self._state_file.exists():
-            return None
+            return None, False
         try:
             with open(self._state_file, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if not SandboxManager._validate_state(data):
+                logger.warning("Sandbox state file has invalid schema")
+                return None, True
+            return data, False
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to read sandbox state: {}", exc)
-            return None
+            return None, True
+
+    async def _cleanup_orphan_scan(self) -> tuple[int, bool]:
+        """Scan the sandbox base dir for leftover sandbox directories.
+
+        Used when the state file is missing or corrupt: instead of trusting
+        the (possibly lost) registration, enumerate whatever is under the
+        sandbox base dir in Linux/WSL and remove every entry.  This closes
+        the "orphan directory lost from state" leak (#472).
+
+        Returns ``(cleaned, completed)`` — ``completed`` is False when the
+        scan itself could not run (WSL unavailable, timeout) or when any
+        removal failed, so callers know not to drop the damaged state file.
+        """
+        if _is_windows():
+            distro = self.wsl_distro
+            if not distro:
+                distro = await BwrapSandbox._detect_wsl_distro() or ""
+            if not distro:
+                logger.warning("No WSL distro available for orphan scan")
+                return 0, False
+            proc = await _create_subprocess_exec(
+                "wsl.exe", "-d", distro, "--",
+                "find", self.wsl_base_dir, "-mindepth", "1", "-maxdepth", "1", "-type", "d",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        else:
+            proc = await _create_subprocess_exec(
+                "find", str(self.sandbox_base_dir), "-mindepth", "1", "-maxdepth", "1", "-type", "d",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+        except asyncio.TimeoutError:
+            logger.warning("Sandbox orphan scan timed out")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            return 0, False
+
+        dirs = [line.strip() for line in out.decode("utf-8", errors="replace").splitlines() if line.strip()]
+        cleaned = 0
+        completed = True
+        for linux_dir in dirs:
+            try:
+                if await BwrapSandbox.cleanup_dir(
+                    linux_dir, self.wsl_distro,
+                    expected_root=self._sandbox_root(),
+                ):
+                    cleaned += 1
+                    logger.info("Orphan scan cleaned sandbox: {}", linux_dir)
+                else:
+                    completed = False
+                    logger.warning("Orphan scan failed to remove: {}", linux_dir)
+            except Exception as exc:
+                completed = False
+                logger.warning("Orphan scan error on {}: {}", linux_dir, exc)
+        if cleaned:
+            logger.info("Sandbox orphan scan complete: {} removed", cleaned)
+        return cleaned, completed
+
+    def _sandbox_root(self) -> str:
+        """The expected sandbox root for cleanup validation (native or WSL)."""
+        if _is_windows():
+            return self.wsl_base_dir
+        return str(self.sandbox_base_dir)
 
     async def cleanup_stale(self) -> int:
         """Clean up sandbox directories left from a previous bridge run.
@@ -182,7 +618,29 @@ class SandboxManager:
 
         Returns the number of stale sandboxes cleaned up.
         """
-        state = self._load_state()
+        state, damaged = self._load_state()
+        if damaged:
+            # Corrupt state file — the registered entries are unrecoverable.
+            # Rebuild from a filesystem scan so orphaned directories are not
+            # permanently lost.  Only drop the corrupt file when the scan
+            # actually completed; otherwise keep it so the next startup
+            # retries instead of silently forgetting the orphans (#472).
+            logger.warning(
+                "Sandbox state file corrupt — falling back to directory scan"
+            )
+            cleaned, completed = await self._cleanup_orphan_scan()
+            if completed:
+                try:
+                    if self._state_file.exists():
+                        self._state_file.unlink()
+                except OSError as exc:
+                    logger.warning("Failed to remove corrupt state file: {}", exc)
+            else:
+                logger.warning(
+                    "Orphan scan incomplete — keeping corrupt state file for retry"
+                )
+            return cleaned
+
         if state is None:
             return 0
 
@@ -193,6 +651,7 @@ class SandboxManager:
             return 0
 
         cleaned = 0
+        failures = 0
         for entry in entries:
             linux_base_dir = entry.get("linux_base_dir")
             if not linux_base_dir:
@@ -200,23 +659,38 @@ class SandboxManager:
 
             # Use BwrapSandbox's static cleanup helper
             try:
-                await BwrapSandbox.cleanup_dir(
+                if await BwrapSandbox.cleanup_dir(
                     linux_base_dir,
                     wsl_distro=self.wsl_distro,
-                )
-                cleaned += 1
-                logger.info(
-                    "Cleaned up stale sandbox: {} ({})",
-                    entry.get("session_key", "?"), linux_base_dir,
-                )
+                    expected_root=self._sandbox_root(),
+                ):
+                    cleaned += 1
+                    logger.info(
+                        "Cleaned up stale sandbox: {} ({})",
+                        entry.get("session_key", "?"), linux_base_dir,
+                    )
+                else:
+                    failures += 1
+                    logger.warning(
+                        "Failed to clean stale sandbox {} ({})",
+                        entry.get("session_key", "?"), linux_base_dir,
+                    )
             except Exception as exc:
+                failures += 1
                 logger.warning(
                     "Failed to clean stale sandbox {}: {}",
                     entry.get("session_key", "?"), exc,
                 )
 
-        # Clear the state file — all listed sandboxes have been handled
-        self._clear_state_file()
+        if failures == 0:
+            # All listed sandboxes handled — safe to drop the state file.
+            self._clear_state_file()
+        else:
+            # Keep the state file so failed directories are retried on the
+            # next startup instead of being silently forgotten (#472).
+            logger.warning(
+                "{} stale sandbox(s) failed cleanup — state kept for retry", failures
+            )
         logger.info("Stale sandbox cleanup complete: {} removed", cleaned)
         return cleaned
 

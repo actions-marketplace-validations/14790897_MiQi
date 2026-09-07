@@ -14,7 +14,7 @@ const STATES: Record<string, { label: string; color: string }> = {
 
 export function StatusBar() {
   const { status, start, stop } = useRuntime();
-  const { restartRequired, clearRestartRequired } = useRestartRequired();
+  const { restartRequired, restartReasons, clearRestartRequired } = useRestartRequired();
   const s = STATES[status.state] ?? STATES.stopped;
   const [restarting, setRestarting] = useState(false);
   const [restartError, setRestartError] = useState<string | null>(null);
@@ -69,8 +69,24 @@ export function StatusBar() {
       )}
 
       {restartRequired && (
-        <span className="flex items-center gap-2" style={{ color: 'var(--warning)' }}>
+        <span
+          className="flex items-center gap-2"
+          style={{ color: 'var(--warning)' }}
+          title={
+            restartReasons.length > 0
+              ? `需要重启的原因：${restartReasons.join('；')}`
+              : '部分配置需要重启应用后才能生效'
+          }
+        >
           配置已变更
+          {restartReasons.length > 0 && (
+            <span
+              className="text-[var(--text-faint)] max-w-[220px] truncate"
+              title={restartReasons.join('；')}
+            >
+              {restartReasons[0]}
+            </span>
+          )}
           <button
             onClick={handleRestart}
             disabled={restarting}
@@ -86,7 +102,7 @@ export function StatusBar() {
       {restartError && <span style={{ color: 'var(--danger)' }}>{restartError}</span>}
 
       <span className="ml-auto text-text-faint">
-        MiQi Desktop v{typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev'}
+        MiQroForge Desktop v{typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev'}
       </span>
     </div>
   );

@@ -7,61 +7,12 @@ from typing import Any
 
 from miqi.agent.tools.base import Tool
 from miqi.agent.tools.filesystem import _persist_tracked_file
-
-
-def _raw_output_path(kwargs: dict[str, Any]) -> str:
-    return str(
-        kwargs.get("filename")
-        or kwargs.get("file_path")
-        or kwargs.get("path")
-        or ""
-    )
-
-
-def _ensure_suffix(path: Path, suffix: str) -> Path:
-    if not path.name or path.name in {".", ".."}:
-        raise ValueError("output filename is required")
-    if path.suffix.lower() == suffix:
-        return path
-    return path.with_suffix(suffix)
-
-
-def _enforce_boundary(path: Path, allowed_dir: Path | None, workspace: Path | None) -> None:
-    effective_dir = allowed_dir or workspace
-    if effective_dir is None:
-        return
-    try:
-        path.resolve().relative_to(effective_dir.resolve())
-    except ValueError:
-        raise PermissionError(
-            f"Path '{path}' resolves outside allowed directory '{effective_dir}'"
-        )
-
-
-def _resolve_output_path(
-    file_path: str,
-    workspace: Path | None,
-    allowed_dir: Path | None,
-) -> Path:
-    """Resolve an output path and enforce workspace/directory bounds."""
-    p = Path(file_path).expanduser()
-    if not p.is_absolute() and workspace is not None:
-        p = workspace / p
-    resolved = p.resolve()
-
-    effective_dir = allowed_dir
-    if effective_dir is None and workspace is not None:
-        effective_dir = workspace.resolve()
-
-    if effective_dir is not None:
-        try:
-            resolved.relative_to(effective_dir.resolve())
-        except ValueError:
-            raise PermissionError(
-                f"Path '{file_path}' resolves outside allowed directory "
-                f"'{effective_dir}'"
-            )
-    return resolved
+from miqi.documents.path_utils import (
+    enforce_boundary,
+    ensure_suffix,
+    raw_output_path,
+    resolve_output_path,
+)
 
 
 def _cell_value_matches(actual: Any, expected: Any) -> bool:
@@ -223,21 +174,21 @@ class XlsxReadTool(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         _sess_key = kwargs.pop("_session_key", None)
-        raw_path = _raw_output_path(kwargs)
+        raw_path = raw_output_path(kwargs)
         if not raw_path.strip():
-            return "Error: filename is required"
+            return "Error: 必须提供 filename"
         try:
-            file_path = _resolve_output_path(
+            file_path = resolve_output_path(
                 raw_path, self._workspace, self._allowed_dir,
             )
-            file_path = _ensure_suffix(file_path, ".xlsx")
-            _enforce_boundary(file_path, self._allowed_dir, self._workspace)
+            file_path = ensure_suffix(file_path, ".xlsx")
+            enforce_boundary(file_path, self._allowed_dir, self._workspace)
         except PermissionError as e:
-            return f"Error: Permission denied: {e}"
+            return f"Error: 权限被拒绝：{e}"
         except ValueError as e:
             return f"Error: {e}"
         if not file_path.exists():
-            return f"Error: file not found: {file_path}"
+            return f"Error: 文件不存在：{file_path}"
         try:
             from openpyxl import load_workbook
 
@@ -333,24 +284,24 @@ class CreateXlsxTool(Tool):
         from openpyxl import Workbook
 
         _sess_key = kwargs.pop("_session_key", None)
-        raw_path = _raw_output_path(kwargs)
+        raw_path = raw_output_path(kwargs)
         sheets = kwargs.get("sheets")
         rows = kwargs.get("rows")
         if not raw_path.strip():
-            return "Error: filename is required"
+            return "Error: 必须提供 filename"
 
         try:
-            file_path = _resolve_output_path(
+            file_path = resolve_output_path(
                 raw_path, self._workspace, self._allowed_dir,
             )
-            file_path = _ensure_suffix(file_path, ".xlsx")
-            _enforce_boundary(file_path, self._allowed_dir, self._workspace)
+            file_path = ensure_suffix(file_path, ".xlsx")
+            enforce_boundary(file_path, self._allowed_dir, self._workspace)
         except PermissionError as e:
-            return f"Error: Permission denied: {e}"
+            return f"Error: 权限被拒绝：{e}"
         except ValueError as e:
             return f"Error: {e}"
         if sheets is None and rows is None:
-            return "Error: sheets or rows is required"
+            return "Error: 必须提供 sheets 或 rows"
 
         try:
             wb = Workbook()
@@ -372,10 +323,10 @@ class CreateXlsxTool(Tool):
             elif isinstance(sheets, list):
                 sheet_specs = sheets
             else:
-                return "Error: sheets must be an object or array"
+                return "Error: sheets 必须是对象或数组"
 
             if not sheet_specs:
-                return "Error: sheets must contain at least one sheet"
+                return "Error: sheets 至少需要包含一个工作表"
 
             created_sheets = 0
             for index, spec in enumerate(sheet_specs):
@@ -392,7 +343,7 @@ class CreateXlsxTool(Tool):
                     _add_chart(ws, chart_spec)
 
             if created_sheets == 0:
-                return "Error: sheets must contain sheet objects"
+                return "Error: sheets 必须包含工作表对象"
 
             file_path.parent.mkdir(parents=True, exist_ok=True)
             wb.save(str(file_path))
@@ -468,27 +419,27 @@ class AppendXlsxTool(Tool):
         from openpyxl import load_workbook
 
         _sess_key = kwargs.pop("_session_key", None)
-        raw_path = _raw_output_path(kwargs)
+        raw_path = raw_output_path(kwargs)
         if not raw_path.strip():
-            return "Error: filename is required"
+            return "Error: 必须提供 filename"
 
         try:
-            file_path = _resolve_output_path(
+            file_path = resolve_output_path(
                 raw_path, self._workspace, self._allowed_dir,
             )
-            file_path = _ensure_suffix(file_path, ".xlsx")
-            _enforce_boundary(file_path, self._allowed_dir, self._workspace)
+            file_path = ensure_suffix(file_path, ".xlsx")
+            enforce_boundary(file_path, self._allowed_dir, self._workspace)
         except PermissionError as e:
-            return f"Error: Permission denied: {e}"
+            return f"Error: 权限被拒绝：{e}"
         except ValueError as e:
             return f"Error: {e}"
 
         if not file_path.exists():
-            return f"Error: file not found: {file_path}"
+            return f"Error: 文件不存在：{file_path}"
 
         rows = kwargs.get("rows") or []
         if not rows:
-            return "Error: rows is required"
+            return "Error: 必须提供 rows"
 
         try:
             wb = load_workbook(str(file_path))
@@ -500,7 +451,7 @@ class AppendXlsxTool(Tool):
                     ws = wb.create_sheet(str(sheet_name)[:31])
                 else:
                     wb.close()
-                    return f"Error: sheet not found: {sheet_name}"
+                    return f"Error: 未找到工作表：{sheet_name}"
             else:
                 ws = wb.active
 

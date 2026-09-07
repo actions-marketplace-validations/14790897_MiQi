@@ -1,10 +1,12 @@
 import { electron } from '../../shared/electron';
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'fs';
-import { homedir } from 'os';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from 'fs';
+import { homedir, tmpdir } from 'os';
+import { randomUUID } from 'crypto';
 import { isAbsolute, join } from 'path';
+import type { BrowserWindow } from 'electron';
 import type { BridgeManager } from '../bridge';
 import {
   IPC,
@@ -19,6 +21,7 @@ import {
   ProviderTestInput,
   ProviderUpdateInput,
   ProviderActivateInput,
+  ProviderDeactivateInput,
   ChannelsUpdateInput,
   CronCreateInput,
   CronUpdateInput,
@@ -32,6 +35,7 @@ import {
   SkillsGetInput,
   FilesReadInput,
   FilesWriteInput,
+  FilesSaveAsInput,
   McpUpsertInput,
   McpDeleteInput,
   AgentSpawnInput,
@@ -49,8 +53,9 @@ import type {
   WslInstallProgress,
   WslInstallAndProvisionResult,
 } from '../../shared/ipc';
+import { registerQraftIpcHandlers } from '../qraft/ipc';
 
-const { ipcMain, dialog, shell } = electron;
+const { ipcMain, dialog, shell, app } = electron;
 
 function readWorkspaceLogLines(
   projectRoot: string,
@@ -129,7 +134,7 @@ function resolveWorkspacePath(raw: string): string {
   return resolved;
 }
 
-function getWorkspacePath(): string {
+export function getWorkspacePath(): string {
   const config = readLocalConfig();
   const agents = (config['agents'] as Record<string, unknown> | undefined) ?? {};
   const defaults = (agents['defaults'] as Record<string, unknown> | undefined) ?? {};
@@ -309,6 +314,7 @@ export function registerIpcHandlers(bridge: BridgeManager): void {
         mode: input.mode,
         attachments: input.attachments,
         workspace: input.workspace,
+        resume_turn_id: (input as any).resume_turn_id ?? undefined,
       },
       (type: string, data: unknown) => {
         if (type === 'progress') {
@@ -323,8 +329,45 @@ export function registerIpcHandlers(bridge: BridgeManager): void {
           safeSend('approval:request', data);
         } else if (type === 'approval_cleared') {
           safeSend('approval:cleared', data);
+        } else if (type === 'user_input_requested') {
+          safeSend('userInput:request', data);
+        } else if (type === 'user_input_resolved') {
+          safeSend('userInput:resolved', data);
         } else if (type === 'subagent_result') {
           safeSend('chat:subagent_result', data);
+        } else if (type === 'slurm_job_running') {
+          // Slurm 作业 RUNNING 扣费（issue #927）：主进程发起扣费（10 分/次，
+          // 按作业 ID 去重），结果以 #915 的 points 事件流在聊天区展示。
+          // 作业已在运行，扣费失败（余额不足等）不阻断作业，仅记录并提示。
+          void (async () => {
+            const { getQraftService } = await import('../qraft/ipc');
+            const payload = (data ?? {}) as Record<string, unknown>;
+            const result = await getQraftService().chargeSlurmJob({
+              charge_id: String(payload.charge_id ?? ''),
+              job_id: String(payload.job_id ?? ''),
+              server_name: String(payload.server_name ?? ''),
+              tool_name: String(payload.tool_name ?? ''),
+              args_summary: String(payload.args_summary ?? ''),
+              session_key: String(payload.session_key ?? ''),
+              turn_id: String(payload.turn_id ?? ''),
+            });
+            // 去重命中（该作业已计费过）：不当作新的扣费播报，聊天区
+            // 不出现重复的「已扣 10 积分」（CodeRabbit #936 评审）。
+            if (result.dedup) return;
+            safeSend('chat:progress', {
+              stream: 'points',
+              type: result.ok ? 'billed' : 'blocked',
+              points_cost: 10,
+              balance: result.balance ?? null,
+              message: result.ok
+                ? `Slurm 作业已扣 10 积分，可用余额 ${result.balance}`
+                : (result.message ?? 'Slurm 作业计费失败'),
+            });
+          })().catch((err) => {
+            console.error(
+              `[qraft] slurm 计费处理异常：${err instanceof Error ? err.message : err}`
+            );
+          });
         } else if (type === 'chat:delta' || type === 'delta') {
           safeSend('chat:progress', data);
         }
@@ -336,7 +379,35 @@ export function registerIpcHandlers(bridge: BridgeManager): void {
 
   ipcMain.handle(IPC.CHAT_ABORT, async (_event, payload: unknown) => {
     const input = ChatAbortInput.parse(payload);
-    return bridge.send('chat.abort', { session_key: input.session_key });
+    return bridge.send('chat.abort', {
+      session_key: input.session_key,
+      thread_id: input.thread_id,
+    });
+  });
+
+  // #740: discard an interrupted turn's execution snapshot (重新开始)
+  ipcMain.handle(IPC.CHAT_DISCARD_RESUME, async (_event, payload: unknown) => {
+    const input = (payload ?? {}) as {
+      resume_turn_id?: string;
+      session_key?: string;
+    };
+    return bridge.send('chat.discard_resume', {
+      resume_turn_id: input.resume_turn_id,
+      session_key: input.session_key,
+    });
+  });
+
+  // Clipboard write from the sandboxed renderer.  The electron clipboard
+  // module is NOT available in sandboxed preloads, so the write is routed
+  // here to the main process (works for file:// packaged builds too).
+  ipcMain.handle(IPC.CLIPBOARD_WRITE_TEXT, (_event, payload: { text?: unknown }) => {
+    try {
+      const text = typeof payload?.text === 'string' ? payload.text : String(payload?.text ?? '');
+      electron.clipboard.writeText(text);
+      return { ok: true };
+    } catch {
+      return { ok: false };
+    }
   });
 
   // HEAD-check a URL in the main process (no CORS) — used by "查看来源"
@@ -554,6 +625,18 @@ export function registerIpcHandlers(bridge: BridgeManager): void {
     return bridge.send('providers.activate', input as Record<string, unknown>);
   });
 
+  ipcMain.handle(IPC.PROVIDERS_DEACTIVATE, async (_event, payload: unknown) => {
+    const input = ProviderDeactivateInput.parse(payload);
+    return bridge.send('providers.deactivate', input as Record<string, unknown>);
+  });
+
+  // -----------------------------------------------------------------------
+  // Models (model/list catalog — issue #788 常用模型预设)
+  // -----------------------------------------------------------------------
+  ipcMain.handle(IPC.MODEL_LIST, async () => {
+    return bridge.sendSafe('model/list');
+  });
+
   // -----------------------------------------------------------------------
   // Channels
   // -----------------------------------------------------------------------
@@ -579,27 +662,12 @@ export function registerIpcHandlers(bridge: BridgeManager): void {
     const bridgeExeName = process.platform === 'win32' ? 'miqi-bridge.exe' : 'miqi-bridge';
     const bundledBridge = join(process.resourcesPath, bridgeExeName);
     if (existsSync(bundledBridge)) {
+      // Packaged mode: the bundled bridge existing proves Python + deps are
+      // complete. Skip the cold-start `--check` spawnSync — spawning the
+      // onefile binary (extraction + interpreter + imports) took 10-15s and
+      // blocked the whole app startup because `server.py` does not handle
+      // `--check` and the sync call only returned on timeout (#603).
       pythonVersion = 'bundled';
-      try {
-        const checkResult = spawnSync(bundledBridge, ['--check'], {
-          timeout: 15000,
-          encoding: 'utf8',
-          windowsHide: true,
-        });
-        if (checkResult.status === 0 && checkResult.stdout) {
-          try {
-            const info = JSON.parse((checkResult.stdout as string).trim());
-            if (info.python_version) pythonVersion = info.python_version;
-            if (Array.isArray(info.issues) && info.issues.length > 0) {
-              issues.push(...info.issues);
-            }
-          } catch {
-            // JSON parse failed — not critical, bundled exe exists
-          }
-        }
-      } catch {
-        // --check timeout or error — not critical, bundled exe exists
-      }
     } else {
       // Development environment: check system Python
       const candidates: string[][] = [];
@@ -665,7 +733,7 @@ for m in ("pydantic", "httpx", "loguru"):
             }
           }
         } catch {
-          issues.push('Could not check MiQi dependencies');
+          issues.push('Could not check MiQroForge dependencies');
         }
       }
     }
@@ -1021,14 +1089,14 @@ for m in ("pydantic", "httpx", "loguru"):
         safeSend(IPC_EVENTS.WSL_INSTALL_PROGRESS, {
           phase: 'enabling_features',
           rebootRequired: true,
-          message: 'Windows 功能已启用。需要重启系统，重启后 MiQi 将自动继续安装。',
+          message: 'Windows 功能已启用。需要重启系统，重启后 MiQroForge 将自动继续安装。',
         } satisfies WslInstallProgress);
 
         return {
           success: true,
           phase: 'enabling_features',
           rebootRequired: true,
-          nextStep: '请重启系统，重新打开 MiQi 后向导将自动继续',
+          nextStep: '请重启系统，重新打开 MiQroForge 后向导将自动继续',
         } satisfies WslInstallAndProvisionResult;
       }
 
@@ -1077,7 +1145,7 @@ for m in ("pydantic", "httpx", "loguru"):
           success: true,
           phase: 'installing_wsl',
           rebootRequired: true,
-          nextStep: '请重启系统，重新打开 MiQi 后向导将自动继续',
+          nextStep: '请重启系统，重新打开 MiQroForge 后向导将自动继续',
         } satisfies WslInstallAndProvisionResult;
       }
 
@@ -1491,6 +1559,11 @@ for m in ("pydantic", "httpx", "loguru"):
     return res;
   });
 
+  // #854: allow_system_installs runtime toggle (no restart)
+  ipcMain.handle(IPC.SANDBOX_SET_ALLOW_SYSTEM_INSTALLS, async (_event, enabled: boolean) => {
+    return bridge.send('sandbox.setAllowSystemInstalls', { enabled });
+  });
+
   ipcMain.handle(IPC.DIALOG_OPEN_FILE, async () => {
     const result = await dialog.showOpenDialog({
       properties: ['openFile', 'openDirectory'],
@@ -1521,6 +1594,14 @@ for m in ("pydantic", "httpx", "loguru"):
   ipcMain.handle('approvals:resolve', async (_event, payload: unknown) => {
     const p = payload as { approval_id: string; decision: string };
     return bridge.send('approvals.resolve', p as Record<string, unknown>);
+  });
+
+  // -----------------------------------------------------------------------
+  // User input (issue #646: ask_user_confirm_card)
+  // -----------------------------------------------------------------------
+  ipcMain.handle('userInput:resolve', async (_event, payload: unknown) => {
+    const p = payload as { input_id: string; choice_id: string; choice_label: string };
+    return bridge.send('userInput.resolve', p as Record<string, unknown>);
   });
 
   ipcMain.handle('approvals:clear_permanent', async (_event, payload: unknown) => {
@@ -1696,9 +1777,62 @@ for m in ("pydantic", "httpx", "loguru"):
     }
   });
 
+  // #877: preview「下载/另存为」— native save dialog + write bytes.
+  ipcMain.handle(IPC.FILES_SAVE_AS, async (event, payload: unknown) => {
+    const input = FilesSaveAsInput.parse(payload);
+    const win = electron.BrowserWindow.fromWebContents(event.sender);
+    if (!win) return { saved: false, error: 'no window' };
+    const safe = input.default_name.replace(/[\\/:*?"<>|]/g, '_').slice(-120) || 'download';
+    const picked = await dialog.showSaveDialog(win, {
+      title: '另存为',
+      defaultPath: safe,
+    });
+    if (picked.canceled || !picked.filePath) {
+      return { saved: false, canceled: true };
+    }
+    try {
+      writeFileSync(picked.filePath, Buffer.from(input.data_base64, 'base64'));
+      return { saved: true, path: picked.filePath };
+    } catch (err) {
+      return { saved: false, error: String(err) };
+    }
+  });
+
   // -- WSL helpers (async — must not block the Electron main thread) -----
 
   const execFileAsync = promisify(execFile);
+
+  /** promisified spawn with stdin input — execFile's options don't accept
+   *  `input`, but the WSL search probe feeds a bash script via stdin. */
+  const spawnWithInput = (
+    cmd: string,
+    args: string[],
+    opts: { input?: string; timeout?: number } = {}
+  ): Promise<{ stdout: string }> =>
+    new Promise((resolve, reject) => {
+      const child = spawn(cmd, args, { windowsHide: true });
+      let stdout = '';
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error(`spawn ${cmd} timed out`));
+      }, opts.timeout ?? 10_000);
+      child.stdout?.on('data', (d: Buffer) => {
+        stdout += d.toString('utf8');
+      });
+      // Keep the stderr pipe drained so a chatty probe can't deadlock the child.
+      child.stderr?.on('data', () => {});
+      child.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve({ stdout });
+        else reject(new Error(`spawn ${cmd} exited ${code}`));
+      });
+      if (opts.input) child.stdin.write(opts.input);
+      child.stdin.end();
+    });
 
   async function findFileInWsl(
     relPath: string
@@ -1737,9 +1871,9 @@ for m in ("pydantic", "httpx", "loguru"):
 
     for (const distro of distros) {
       try {
-        const { stdout } = await execFileAsync('wsl.exe', ['-d', distro, '--', 'bash'], {
-          ...execOpts,
+        const { stdout } = await spawnWithInput('wsl.exe', ['-d', distro, '--', 'bash'], {
           input: searchScript,
+          timeout: execOpts.timeout,
         });
         if (stdout?.trim()) return { wslAbsPath: stdout.trim(), distro };
       } catch {
@@ -1849,6 +1983,32 @@ for m in ("pydantic", "httpx", "loguru"):
     return { opened: true, path: raw };
   });
 
+  // -- Open an HTML string in the system default browser -------------------
+  // Write the content to a temp .html file (so relative CSS/scripts resolve
+  // normally) and hand it to the OS default handler — the browser for .html.
+  ipcMain.handle(IPC.HTML_OPEN_IN_BROWSER, async (_event, payload: unknown) => {
+    const p = payload as { html: string };
+    const html = typeof p?.html === 'string' ? p.html : '';
+    // Unpredictable name + owner-only permissions: the file holds AI-generated
+    // HTML and is written to the shared temp dir. Delete shortly after the
+    // browser has had a chance to read it.
+    const tmpPath = join(tmpdir(), `miqi-preview-${randomUUID()}.html`);
+    try {
+      writeFileSync(tmpPath, html, { encoding: 'utf8', mode: 0o600 });
+      const error = await shell.openPath(tmpPath);
+      setTimeout(() => {
+        try {
+          unlinkSync(tmpPath);
+        } catch {
+          /* already gone */
+        }
+      }, 60_000);
+      return error ? { opened: false, path: tmpPath, error } : { opened: true, path: tmpPath };
+    } catch (e: any) {
+      return { opened: false, path: tmpPath, error: e?.message ?? String(e) };
+    }
+  });
+
   // -- Reveal file in system file manager (Explorer / Finder) ------------
   ipcMain.handle(IPC.FILES_OPEN_CONTAINING_FOLDER, async (_event, payload: unknown) => {
     const p = payload as { path: string };
@@ -1877,6 +2037,63 @@ for m in ("pydantic", "httpx", "loguru"):
     }
   });
 
+  // #667: 直接下载（论文 PDF 等）——webContents.downloadURL 走 Electron 下载器
+  // 按发起方 webContents 关联 will-download（session 是全局的，其他窗口/
+  // 并发下载会串文件名），等 DownloadItem 的 done 事件后按真实结果返回，
+  // 避免渲染层把取消/失败当作成功（CodeRabbit #668 review）。
+  ipcMain.handle(IPC.DOWNLOADS_DOWNLOAD, async (event, payload: unknown) => {
+    const p = payload as { url?: string; filename?: string };
+    const url = p?.url ?? '';
+    if (!/^https?:\/\//i.test(url)) return { ok: false, error: 'invalid url' };
+    const win = electron.BrowserWindow.fromWebContents(event.sender);
+    if (!win) return { ok: false, error: 'no window' };
+    const safe = p.filename ? p.filename.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120) : undefined;
+    // #696: 保存位置由用户选择（保存对话框），不再固定 Downloads 目录
+    const picked = await electron.dialog.showSaveDialog(win, {
+      title: '保存文件',
+      defaultPath: join(electron.app.getPath('downloads'), safe || 'download.pdf'),
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    });
+    if (picked.canceled || !picked.filePath) {
+      return { ok: false, error: 'cancelled' };
+    }
+    const session = win.webContents.session;
+    return await new Promise<{ ok: boolean; error?: string; savePath?: string }>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (ok: boolean, error?: string) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        session.removeListener('will-download', onWillDownload);
+        resolve(ok ? { ok, savePath: picked.filePath } : { ok, error });
+      };
+      const onWillDownload = (
+        _e: Electron.Event,
+        item: Electron.DownloadItem,
+        wc: Electron.WebContents
+      ) => {
+        // Only the initiating webContents's downloads get our filename.
+        if (wc !== win.webContents) return;
+        try {
+          item.setSavePath(picked.filePath);
+        } catch {
+          // fall back to default download path
+        }
+        item.once('done', (_ev, state) => {
+          finish(state === 'completed', state === 'completed' ? undefined : `download ${state}`);
+        });
+      };
+      session.on('will-download', onWillDownload);
+      win.webContents.downloadURL(url);
+      // Guard: if will-download never fires (e.g. the URL navigates instead
+      // of downloading), don't leave the renderer hanging forever.
+      timer = setTimeout(() => {
+        finish(false, 'download did not start');
+      }, 60_000);
+    });
+  });
+
   // -- Document parsing -----------------------------------------------------
   ipcMain.handle(IPC.DOCUMENTS_PARSE, async (_event, payload: unknown) => {
     return bridge.sendSafe('documents.parse', payload as Record<string, unknown>);
@@ -1898,11 +2115,11 @@ for m in ("pydantic", "httpx", "loguru"):
   });
 
   ipcMain.handle(IPC.CONFIG_WRITE_INITIAL, (_event, payload: unknown) => {
-    const { provider_name, api_key, api_base, model, workspace } = payload as {
-      provider_name?: string | null;
-      api_key?: string | null;
-      api_base?: string | null;
-      model?: string | null;
+    // #835 收口：provider 凭据与默认模型只允许经后端收口接口写入
+    //（providers.activate / config.update）。此通道原先可绕过全部校验
+    // 直写 provider_name/api_key/api_base/model 到 config.json（#929
+    // review），现在只保留 workspace 初始化。
+    const { workspace } = payload as {
       workspace?: string | null;
     };
     const configDir = getConfigDir();
@@ -1917,21 +2134,10 @@ for m in ("pydantic", "httpx", "loguru"):
       // Start fresh
     }
 
-    if (provider_name) {
-      const providers = (existing['providers'] as Record<string, unknown> | undefined) ?? {};
-      providers[provider_name] = {
-        ...((providers[provider_name] as Record<string, unknown> | undefined) ?? {}),
-        ...(api_key ? { apiKey: api_key } : {}),
-        ...(api_base ? { apiBase: api_base } : {}),
-      };
-      existing['providers'] = providers;
-    }
-
-    if (model || workspace) {
+    if (workspace) {
       const agents = (existing['agents'] as Record<string, unknown> | undefined) ?? {};
       const defaults = (agents['defaults'] as Record<string, unknown> | undefined) ?? {};
-      if (model) defaults['model'] = model;
-      if (workspace) defaults['workspace'] = workspace;
+      defaults['workspace'] = workspace;
       agents['defaults'] = defaults;
       existing['agents'] = agents;
     }
@@ -2113,6 +2319,10 @@ for m in ("pydantic", "httpx", "loguru"):
           safeSend('approval:request', data);
         } else if (type === 'approval_cleared') {
           safeSend('approval:cleared', data);
+        } else if (type === 'user_input_requested') {
+          safeSend('userInput:request', data);
+        } else if (type === 'user_input_resolved') {
+          safeSend('userInput:resolved', data);
         } else {
           safeSend('chat:progress', data);
         }
@@ -2126,5 +2336,38 @@ for m in ("pydantic", "httpx", "loguru"):
       threadId: input.thread_id,
       turnId: input.turn_id,
     });
+  });
+
+  // MiQroForge 平台 OAuth2 登录 (issue #726) — 主进程本地处理，不依赖 bridge。
+  registerQraftIpcHandlers();
+
+  // 隐私协议拒绝退出 (#837)：macOS 上 window.close() 不终止应用，
+  // 统一由主进程 app.quit() 收尾。
+  ipcMain.handle(IPC.APP_QUIT, () => {
+    app.quit();
+    return { ok: true };
+  });
+
+  // 空会话回到欢迎态后把窗口带回前台（renderer 触发）。best-effort：窗口未聚焦
+  // 则 restore/show/focus；仍不聚焦则 moveTop 重试。{ hard: true } 表示 renderer
+  // 检测到 document.hasFocus()==false（window.confirm 模态关闭后页面焦点未交还）——
+  // 此时窗口即便已 OS 聚焦，win.focus() 也不产生激活变化，须 blur→focus 逼
+  // Chromium 重新下发页面焦点，否则键盘事件被吞、输入框点了没反应。
+  ipcMain.handle(IPC.APP_FOCUS, (_event, opts) => {
+    const win = electron.BrowserWindow.fromWebContents(_event.sender);
+    if (!win) return { ok: false };
+    const hard = !!opts && typeof opts === 'object' && (opts as { hard?: boolean }).hard === true;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    if (hard && !win.isDestroyed()) {
+      win.blur();
+      win.focus();
+      if (win.isMinimized()) win.restore();
+    } else if (!win.isFocused() && !win.isDestroyed()) {
+      win.moveTop();
+      win.focus();
+    }
+    return { ok: true, focused: !win.isDestroyed() && win.isFocused() };
   });
 }

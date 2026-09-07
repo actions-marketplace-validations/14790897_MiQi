@@ -10,16 +10,18 @@
  */
 import { _electron as electron, test, expect } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
-import {
-  launchElectronApp,
-  closeElectronApp,
-} from './helpers/electron-setup';
+import { launchElectronApp, closeElectronApp, sendMessage } from './helpers/electron-setup';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
 // ── Test fixture directory ─────────────────────────────────────────────
 const FIXTURE_DIR = path.join(os.tmpdir(), 'miqi-e2e-attachment-fixtures');
+
+// 107-char filename that overflows the user-bubble chip without truncation
+// (regression of #591 fix — issue #698).
+const LONG_FILENAME =
+  'Amide_Bond_Formation_A_Cost_Effectiveness_Analysis_of_Gold_s_Reagent_vs_Traditional_Coupling_Agents.pdf';
 
 // ── CRC-32 (used by ZIP) ───────────────────────────────────────────────
 function crc32(buf: Buffer): number {
@@ -42,7 +44,7 @@ function minimalPdf(): Buffer {
       '3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\n' +
       'xref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n' +
       'trailer<</Size 4/Root 1 0 R>>\nstartxref\n190\n%%EOF',
-    'utf-8',
+    'utf-8'
   );
 }
 
@@ -148,7 +150,7 @@ function makeDocx(): Buffer {
           `<Default Extension="xml" ContentType="application/xml"/>` +
           `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
           `</Types>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -157,7 +159,7 @@ function makeDocx(): Buffer {
         `${XML_DECL}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
           `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
           `</Relationships>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -166,7 +168,7 @@ function makeDocx(): Buffer {
         `${XML_DECL}<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
           `<w:body><w:p><w:r><w:t>Hello DOCX</w:t></w:r></w:p></w:body>` +
           `</w:document>`,
-        'utf-8',
+        'utf-8'
       ),
     },
   ]);
@@ -183,7 +185,7 @@ function makeXlsx(): Buffer {
           `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
           `<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>` +
           `</Types>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -192,7 +194,7 @@ function makeXlsx(): Buffer {
         `${XML_DECL}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
           `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>` +
           `</Relationships>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -201,7 +203,7 @@ function makeXlsx(): Buffer {
         `${XML_DECL}<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
           `<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>` +
           `</workbook>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -210,7 +212,7 @@ function makeXlsx(): Buffer {
         `${XML_DECL}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
           `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>` +
           `</Relationships>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -219,7 +221,7 @@ function makeXlsx(): Buffer {
         `${XML_DECL}<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
           `<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Hello</t></is></c></row></sheetData>` +
           `</worksheet>`,
-        'utf-8',
+        'utf-8'
       ),
     },
   ]);
@@ -236,7 +238,7 @@ function makePptx(): Buffer {
           `<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>` +
           `<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>` +
           `</Types>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -245,7 +247,7 @@ function makePptx(): Buffer {
         `${XML_DECL}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
           `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>` +
           `</Relationships>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -254,7 +256,7 @@ function makePptx(): Buffer {
         `${XML_DECL}<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
           `<p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>` +
           `</p:presentation>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -263,7 +265,7 @@ function makePptx(): Buffer {
         `${XML_DECL}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
           `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/>` +
           `</Relationships>`,
-        'utf-8',
+        'utf-8'
       ),
     },
     {
@@ -272,7 +274,7 @@ function makePptx(): Buffer {
         `${XML_DECL}<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
           `<p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="1" name="Title"/><p:cNvSpPr><p:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr/></p:nvSpPr></p:sp></p:spTree></p:cSld>` +
           `</p:sld>`,
-        'utf-8',
+        'utf-8'
       ),
     },
   ]);
@@ -285,6 +287,7 @@ interface FixtureFiles {
   xlsx: string;
   pptx: string;
   largePdf: string;
+  longNamePdf: string;
 }
 
 function createFixtureFiles(): FixtureFiles {
@@ -296,6 +299,7 @@ function createFixtureFiles(): FixtureFiles {
     xlsx: path.join(FIXTURE_DIR, 'test_xlsx_1.xlsx'),
     pptx: path.join(FIXTURE_DIR, 'AI_guide.pptx'),
     largePdf: path.join(FIXTURE_DIR, 'AI_in_Agriculture_Survey.pdf'),
+    longNamePdf: path.join(FIXTURE_DIR, LONG_FILENAME),
   };
 
   fs.writeFileSync(files.pdf, minimalPdf());
@@ -303,6 +307,7 @@ function createFixtureFiles(): FixtureFiles {
   fs.writeFileSync(files.xlsx, makeXlsx());
   fs.writeFileSync(files.pptx, makePptx());
   fs.writeFileSync(files.largePdf, minimalPdf());
+  fs.writeFileSync(files.longNamePdf, minimalPdf());
 
   return files;
 }
@@ -341,8 +346,22 @@ test.describe('File Attachment Chips', () => {
   });
 
   test.beforeEach(async () => {
-    // Regenerate fixtures: MiQi may consume/move uploaded files
+    // Regenerate fixtures: MiQroForge may consume/move uploaded files
     FILES = ensureFixtureFiles();
+    // Composer attachments persist across tests (single Electron app) —
+    // earlier attach-only tests leave chips behind, which accumulate and
+    // break strict-mode text assertions. Clear leftovers so every test
+    // starts with an empty composer.
+    const removeBtn = page
+      .locator('[data-testid="chat-input-container"]')
+      .locator('xpath=..')
+      .locator('button:has(svg.lucide-x)');
+    while ((await removeBtn.count()) > 0) {
+      await removeBtn
+        .first()
+        .click({ force: true })
+        .catch(() => {});
+    }
   });
 
   test.afterAll(async () => {
@@ -387,7 +406,31 @@ test.describe('File Attachment Chips', () => {
 
   test('Send button disabled while extracting', async () => {
     await attachFile(page, FILES.largePdf);
-    const sendBtn = page.locator('button').filter({ has: page.locator('svg') }).last();
+    const sendBtn = page
+      .locator('button')
+      .filter({ has: page.locator('svg') })
+      .last();
     await expect(sendBtn).toBeAttached({ timeout: 5_000 });
+  });
+
+  test('Long filename chip does not overflow the user bubble (#698)', async () => {
+    await attachFile(page, FILES.longNamePdf);
+    await sendMessage(page, '长文件名附件测试');
+
+    // The sent message renders a document chip in the user bubble. It must
+    // truncate the 107-char name (title keeps the full name for hover) and
+    // never be wider than the bubble content wrapper — #698 regression.
+    // Note: earlier attach-only tests can leave chips in the composer which
+    // are sent along, so target the long-name chip by its title attribute.
+    const bubble = page.getByTestId('chat-message-user').first();
+    const nameSpan = bubble.locator(`span[title="${LONG_FILENAME}"]`);
+    await expect(nameSpan).toHaveAttribute('title', LONG_FILENAME, {
+      timeout: 15_000,
+    });
+
+    const chip = nameSpan.locator('..');
+    const chipBox = await chip.boundingBox();
+    const wrapperBox = await bubble.locator('div.group').boundingBox();
+    expect(chipBox!.width).toBeLessThanOrEqual(wrapperBox!.width + 1);
   });
 });

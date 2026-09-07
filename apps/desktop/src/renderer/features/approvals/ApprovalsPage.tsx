@@ -143,8 +143,7 @@ export function ApprovalsPage() {
   ];
 
   // Global bypass settings
-  const [bypassConfig, setBypassConfig] =
-    useState<ApprovalBypassConfig>(DEFAULT_APPROVAL_BYPASS);
+  const [bypassConfig, setBypassConfig] = useState<ApprovalBypassConfig>(DEFAULT_APPROVAL_BYPASS);
   const [bypassLoading, setBypassLoading] = useState(true);
   const [bypassSaving, setBypassSaving] = useState<ApprovalBypassKey | null>(null);
   const [bypassSaved, setBypassSaved] = useState<ApprovalBypassKey | null>(null);
@@ -292,10 +291,12 @@ export function ApprovalsPage() {
         : (() => {
             const updated = { ...bypassConfig, [key]: enabled };
             // If all 4 individual bypasses are now ON, auto-check bypassAll
-            if (updated.bypassCommandApproval &&
-                updated.bypassFileWriteApproval &&
-                updated.bypassToolConfirmation &&
-                updated.bypassNetworkApproval) {
+            if (
+              updated.bypassCommandApproval &&
+              updated.bypassFileWriteApproval &&
+              updated.bypassToolConfirmation &&
+              updated.bypassNetworkApproval
+            ) {
               updated.bypassAll = true;
             } else {
               updated.bypassAll = false;
@@ -378,9 +379,7 @@ export function ApprovalsPage() {
       <div className="flex items-center justify-between px-5 py-2.5 border-b border-[var(--border-subtle)] bg-[var(--surface)] shrink-0">
         <div>
           <h1 className="text-base font-semibold text-[var(--text)]">命令审批</h1>
-          <p className="text-xs text-[var(--text-muted)] mt-0.5">
-            智能体执行危险命令前需要授权。
-          </p>
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">智能体执行危险命令前需要授权。</p>
         </div>
         <button
           onClick={load}
@@ -407,7 +406,7 @@ export function ApprovalsPage() {
               <Icon size={13} />
               {t.label}
               {t.key === 'pending' && (data?.pending?.length ?? 0) > 0 && (
-                <span className="ml-0.5 bg-[var(--danger)] text-white text-[10px] rounded-full px-1.5 py-0.5 leading-none">
+                <span className="ml-0.5 bg-[var(--danger)] text-white text-size-2xs rounded-full px-1.5 py-0.5 leading-none">
                   {data?.pending?.length}
                 </span>
               )}
@@ -438,10 +437,10 @@ export function ApprovalsPage() {
                 />
                 <h2 className="text-sm font-semibold text-[var(--text)]">审批绕过模式</h2>
                 {bypassSaved === 'bypassAll' && (
-                  <span className="text-[11px] text-[var(--success)]">已保存</span>
+                  <span className="text-size-2xs text-[var(--success)]">已保存</span>
                 )}
               </div>
-              <p className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-tight">
+              <p className="text-size-2xs text-[var(--text-muted)] mt-0.5 leading-tight">
                 开启后跳过审批弹窗。⚡ 仅「允许编辑」模式生效。
               </p>
             </div>
@@ -488,14 +487,12 @@ export function ApprovalsPage() {
                     <span className="flex items-center gap-2 text-xs font-medium text-[var(--text)]">
                       {row.label}
                       {bypassSaved === row.key && (
-                        <span className="text-[11px] text-[var(--success)]">已保存</span>
+                        <span className="text-size-2xs text-[var(--success)]">已保存</span>
                       )}
                     </span>
-                    <span className="block text-[11px] text-[var(--text-muted)] mt-0.5">
+                    <span className="block text-size-2xs text-[var(--text-muted)] mt-0.5">
                       {row.description}
-                      {bypassConfig.bypassAll
-                        ? '。当前由“全部绕过”统一控制'
-                        : ''}
+                      {bypassConfig.bypassAll ? '。当前由“全部绕过”统一控制' : ''}
                     </span>
                   </span>
                   <ToggleSwitch
@@ -517,7 +514,7 @@ export function ApprovalsPage() {
         ) : !data ? (
           <div className="flex flex-col items-center justify-center h-40 gap-2 text-sm text-[var(--text-faint)]">
             <Shield size={24} />
-            <span>MiQi 运行时未启动</span>
+            <span>MiQroForge 运行时未启动</span>
           </div>
         ) : (
           <>
@@ -593,7 +590,7 @@ export function ApprovalsPage() {
                                     if (e.key === 'Enter') handleEditSave();
                                     if (e.key === 'Escape') setEditing(null);
                                   }}
-                                  className="flex-1 text-xs font-mono bg-[var(--surface-elevated)] border border-[var(--border)] rounded px-2 py-1 focus:outline-none focus:border-[var(--accent)]"
+                                  className="flex-1 text-xs font-mono bg-[var(--surface-elevated)] border border-[var(--border)] rounded px-2 py-1 focus:outline-none focus:border-[var(--border-strong)]"
                                   autoFocus
                                 />
                                 <button
@@ -657,7 +654,11 @@ export function ApprovalsPage() {
                                 <span className="text-[var(--text-faint)] shrink-0">
                                   添加时间：
                                 </span>
-                                <span>{entry.added_at ? formatAbsoluteTime(entry.added_at * 1000) : '未知'}</span>
+                                <span>
+                                  {entry.added_at
+                                    ? formatAbsoluteTime(entry.added_at * 1000)
+                                    : '未知'}
+                                </span>
                               </div>
                             </div>
                           )}
@@ -703,7 +704,7 @@ export function ApprovalsPage() {
                             <code className="flex-1 text-xs font-mono text-[var(--text-muted)] truncate">
                               {h.description}
                             </code>
-                            <span className="text-[10px] text-[var(--text-faint)] shrink-0">
+                            <span className="text-size-2xs text-[var(--text-faint)] shrink-0">
                               {formatAbsoluteTime(h.timestamp * 1000)}
                             </span>
                           </div>
@@ -765,7 +766,7 @@ export function ApprovalsPage() {
                           <button
                             key={c.key}
                             onClick={() => setCategoryFilter(c.key)}
-                            className={`px-2 py-0.5 text-[10px] rounded-full transition-colors ${
+                            className={`px-2 py-0.5 text-size-2xs rounded-full transition-colors ${
                               categoryFilter === c.key
                                 ? 'bg-[var(--accent)] text-white'
                                 : 'text-[var(--text-muted)] hover:bg-[var(--surface-muted)]'
@@ -823,7 +824,7 @@ export function ApprovalsPage() {
                                     />
                                   </div>
                                   <span
-                                    className={`text-[10px] font-mono tabular-nums w-8 text-right ${isLow ? 'text-[var(--danger)] font-semibold' : 'text-[var(--text-faint)]'}`}
+                                    className={`text-size-2xs font-mono tabular-nums w-8 text-right ${isLow ? 'text-[var(--danger)] font-semibold' : 'text-[var(--text-faint)]'}`}
                                   >
                                     {remaining}s
                                   </span>
@@ -880,7 +881,13 @@ export function ApprovalsPage() {
 
       {/* ── Add Dialog ────────────────────────────────────────────────── */}
       {showAdd && (
-        <Modal open={showAdd} onOpenChange={(o) => { if (!o) setShowAdd(false); }} hideClose>
+        <Modal
+          open={showAdd}
+          onOpenChange={(o) => {
+            if (!o) setShowAdd(false);
+          }}
+          hideClose
+        >
           <div
             className="bg-[var(--surface-elevated)] border border-[var(--border)] rounded-xl shadow-xl w-full max-w-[420px] mx-4 overflow-hidden"
             onClick={(e) => e.stopPropagation()}
@@ -901,7 +908,7 @@ export function ApprovalsPage() {
                   if (e.key === 'Escape') setShowAdd(false);
                 }}
                 placeholder="例如：rm\s+-rf\s+/tmp/build"
-                className="w-full text-xs font-mono bg-[var(--surface)] border border-[var(--border)] rounded-lg px-3 py-2 focus:outline-none focus:border-[var(--accent)]"
+                className="w-full text-xs font-mono bg-[var(--surface)] border border-[var(--border)] rounded-lg px-3 py-2 focus:outline-none focus:border-[var(--border-strong)]"
                 autoFocus
               />
             </div>

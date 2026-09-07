@@ -24,10 +24,10 @@ const DEFAULT_CONFIG: PermissionsConfig = {
 };
 
 const selectCls =
-  'px-2.5 py-1.5 text-xs rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)]/50 transition-colors';
+  'px-2.5 py-1.5 text-xs rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--text)] focus:outline-none focus:border-[var(--border-strong)]/50 transition-colors';
 
 const inputCls =
-  'flex-1 px-2.5 py-1.5 text-xs rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--text)] placeholder:text-[var(--text-faint)] focus:outline-none focus:border-[var(--accent)]/50 transition-colors';
+  'flex-1 px-2.5 py-1.5 text-xs rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] text-[var(--text)] placeholder:text-[var(--text-faint)] focus:outline-none focus:border-[var(--border-strong)]/50 transition-colors';
 
 export function PermissionsPage() {
   const [config, setConfig] = useState<PermissionsConfig>(DEFAULT_CONFIG);
@@ -133,7 +133,10 @@ export function PermissionsPage() {
                 />
                 递归
               </label>
-              <button onClick={() => removeRule(i)} className="text-[var(--danger)] hover:opacity-70 transition-opacity shrink-0">
+              <button
+                onClick={() => removeRule(i)}
+                className="text-[var(--danger)] hover:opacity-70 transition-opacity shrink-0"
+              >
                 <Trash2 size={14} />
               </button>
             </div>
@@ -194,7 +197,7 @@ export function PermissionsPage() {
           'flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-medium transition duration-200',
           saved
             ? 'bg-[var(--success-bg)] text-[var(--success)]'
-            : 'bg-[var(--accent)] text-[var(--accent-text)] hover:opacity-90',
+            : 'bg-[var(--accent)] text-[var(--accent-text)] hover:opacity-90'
         )}
       >
         {saving ? (

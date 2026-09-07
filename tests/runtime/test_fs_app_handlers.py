@@ -19,7 +19,6 @@ import pytest
 from miqi.runtime.app_server import AppServer, ClientSessionRegistry
 from miqi.runtime.fs_app_handlers import register_fs_handlers
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -250,7 +249,7 @@ class TestFsCreateDirectory:
 
     @pytest.mark.asyncio
     async def test_create_directory_no_recursive_fails_missing_parent(self, tmp_path):
-        """Creating nested directory with recursive=false fails."""
+        """Creating nested directory with recursive=false fails with NOT_FOUND."""
         nested = tmp_path / "x" / "y"
 
         server, registry = _make_server_and_registry(tmp_path)
@@ -259,7 +258,11 @@ class TestFsCreateDirectory:
             "recursive": False,
         })
 
-        assert resp.get("code") != "", f"Expected error, got: {resp}"
+        assert "error" in resp, f"Expected error, got: {resp}"
+        assert resp.get("code") == "NOT_FOUND", (
+            f"Missing parent should map to NOT_FOUND, got: {resp}"
+        )
+        assert not nested.exists(), "Directory must not be created"
 
     @pytest.mark.asyncio
     async def test_create_existing_directory_succeeds(self, tmp_path):
@@ -356,7 +359,7 @@ class TestFsGetMetadata:
                 link.unlink()
 
     @pytest.mark.asyncio
-    async def test_symlink_inside_workspace_reports_isSymlink_true(self, tmp_path):
+    async def test_symlink_inside_workspace_reports_is_symlink_true(self, tmp_path):
         """Regression: fs/getMetadata on a symlink inside workspace returns isSymlink=True.
 
         resolve_workspace_absolute_path with resolve_symlinks=False must

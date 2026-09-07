@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
-import time
 
 
 @dataclass
@@ -21,6 +21,12 @@ class UserMessage:
     input_items: list[dict[str, Any]] = field(default_factory=list)
     client_user_message_id: str | None = None
     settings_overrides: dict[str, Any] = field(default_factory=dict)
+    # #740: resume an interrupted turn — the new turn continues from the
+    # snapshot's half-generated content instead of starting fresh.
+    resume_turn_id: str | None = None
+    # #680: reasoning mode (fast/think) from the frontend mode switch —
+    # consumed by the turn executor to apply generation budget + prompts.
+    reasoning_mode: str | None = None
 
 
 @dataclass

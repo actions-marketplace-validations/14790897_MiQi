@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+
 from loguru import logger
 
 
@@ -147,7 +149,7 @@ class AgentRegistry:
         # Main agent — handles everything by default
         self.register(AgentMetadata(
             name="main",
-            display_name="MiQi",
+            display_name="MiQroForge",
             description="General-purpose AI assistant for code and document tasks",
             system_prompt=self._build_main_prompt(now),
             available_tools=[
@@ -162,6 +164,8 @@ class AgentRegistry:
                 "session_search", "task_begin", "task_end",
                 "skill_manage", "message", "spawn",
                 "paper_search", "paper_get", "paper_download",
+                "ask_user_confirm_card",
+                "graph_render",  # issue #715: skill 产物 step-graph/data-graph 渲染
             ],
         ))
 
@@ -212,12 +216,12 @@ class AgentRegistry:
 
     @staticmethod
     def _build_main_prompt(now: str) -> str:
-        return f"""# MiQi Desktop Agent
+        return f"""# MiQroForge Desktop Agent
 
 ## Current Time
 {now}
 
-You are MiQi, a desktop AI assistant. You can help with:
+You are MiQroForge, a desktop AI assistant. You can help with:
 
 - **Code tasks**: read, write, edit, and execute code
 - **Document tasks**: create and edit Word (.docx), PowerPoint (.pptx), Excel (.xlsx), and **PDF** files
@@ -233,7 +237,7 @@ You are MiQi, a desktop AI assistant. You can help with:
 4. For long tasks, use the plan tool to break them into steps
 5. Save important findings to memory
 6. Write clear, helpful responses in the user's language
-7. **PDF creation: YOU MUST use the `create_pdf` tool.** Do NOT write Python scripts. Do NOT use `create_docx` for PDF tasks. Only `create_pdf` can produce correct PDF files with proper Chinese font support and file tracking.
+7. **Local skills: BEFORE claiming a capability is unavailable, check the "Local Skills" list in the system prompt. If the user's request matches a listed skill, load its SKILL.md via `skill_manage` (action=view, name=<name>) or read_file on its location, and follow its instructions. Never claim a skill does not exist without checking this list first.**
 """
 
     @staticmethod

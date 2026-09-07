@@ -1,9 +1,7 @@
 """CLI commands for MiQi runtime."""
 
-import asyncio
 import os
 import select
-import signal
 import sys
 from pathlib import Path
 
@@ -15,19 +13,20 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.table import Table
 from rich.text import Text
 
 from miqi import __logo__, __version__
-from miqi.config.schema import Config
 from miqi.cli.agent_cmd import register_agent_command
+from miqi.cli.config_cmd import register_config_commands
 from miqi.cli.gateway_cmd import register_gateway_command
 from miqi.cli.management import register_management_commands
 from miqi.cli.onboard import register_onboard_command
+from miqi.cli.trace_cmd import trace_app
+from miqi.config.schema import Config
 
 app = typer.Typer(
     name="miqi",
-    help=f"{__logo__} MiQi Runtime - Personal AI Assistant",
+    help=f"{__logo__} MiQroForge Runtime - Personal AI Assistant",
     no_args_is_help=True,
 )
 
@@ -360,24 +359,31 @@ def _interactive_onboard_setup(config) -> tuple[str, str]:
 
     console.print("\n[bold]2) Configure web search & fetch tools[/bold]")
     console.print("  Search provider options:")
-    console.print("    1. DuckDuckGo (ddgs, default, no API key)")
-    console.print("    2. Brave Search")
-    console.print("    3. Hybrid (ddgs first, fallback to Brave)")
+    console.print("    1. Auto (Tavily → Brave → DDGS, recommended)")
+    console.print("    2. Tavily")
+    console.print("    3. Brave Search")
+    console.print("    4. DuckDuckGo (ddgs, no API key)")
     search_mode = typer.prompt("Search mode", type=int, default=1, show_default=True)
 
     if search_mode == 2:
-        config.tools.web.search.provider = "brave"
+        config.tools.web.search.provider = "tavily"
     elif search_mode == 3:
-        config.tools.web.search.provider = "hybrid"
-    else:
+        config.tools.web.search.provider = "brave"
+    elif search_mode == 4:
         config.tools.web.search.provider = "ddgs"
-
-    if config.tools.web.search.provider in {"brave", "hybrid"}:
-        brave_key = typer.prompt("Brave Search API key", default="", show_default=False).strip()
-        config.tools.web.search.api_key = brave_key
-        if not brave_key:
-            console.print("[yellow]Brave key not set: Brave search may be unavailable.[/yellow]")
     else:
+        config.tools.web.search.provider = "auto"
+
+    if search_mode in (2, 3):
+        key_name = "Tavily" if search_mode == 2 else "Brave"
+        key_attr = "tavily_api_key" if search_mode == 2 else "brave_api_key"
+        key_value = typer.prompt(f"{key_name} Search API key", default="", show_default=False).strip()
+        setattr(config.tools.web.search, key_attr, key_value)
+        if not key_value:
+            console.print(f"[yellow]{key_name} key not set: {key_name} search may be unavailable.[/yellow]")
+    elif search_mode == 1:
+        # Auto 模式沿用 config 里已有的 key（或迁移来的 brave_api_key），
+        # 不在向导里强制询问——key 可在设置页随时配置。
         config.tools.web.search.api_key = ""
 
     console.print("\n  Fetch provider options:")
@@ -718,10 +724,8 @@ register_management_commands(
     print_agent_response=_print_agent_response,
 )
 
-from miqi.cli.config_cmd import register_config_commands
 register_config_commands(app, console=console)
 
-from miqi.cli.trace_cmd import trace_app
 app.add_typer(trace_app, name="trace")
 
 

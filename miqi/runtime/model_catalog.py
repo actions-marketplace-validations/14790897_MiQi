@@ -10,7 +10,6 @@ from typing import Any
 
 from miqi.runtime.model_protocol import ModelView, ProviderCapabilitiesView
 
-
 # Built-in model entries.  Every keyed model references a provider config name.
 # The current configured model is always included (visible) even if absent here.
 _BUILTIN_MODELS: dict[str, dict[str, Any]] = {
@@ -25,6 +24,70 @@ _BUILTIN_MODELS: dict[str, dict[str, Any]] = {
     },
     "anthropic/claude-sonnet-4-6": {
         "name": "Claude Sonnet 4.6",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-3.5-sonnet": {
+        "name": "Claude 3.5 Sonnet",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-3.5-haiku": {
+        "name": "Claude 3.5 Haiku",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-3-opus": {
+        "name": "Claude 3 Opus",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-3-haiku": {
+        "name": "Claude 3 Haiku",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-3-sonnet": {
+        "name": "Claude 3 Sonnet",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-opus-4": {
+        "name": "Claude Opus 4",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-sonnet-4": {
+        "name": "Claude Sonnet 4",
+        "provider": "anthropic",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "anthropic/claude-sonnet-4-5": {
+        "name": "Claude Sonnet 4.5",
         "provider": "anthropic",
         "hidden": False,
         "supported_reasoning_efforts": ["low", "medium", "high"],
@@ -59,22 +122,78 @@ _BUILTIN_MODELS: dict[str, dict[str, Any]] = {
     "openai/gpt-4o-mini": {
         "name": "GPT-4o Mini",
         "provider": "openai",
-        "hidden": True,
+        "hidden": False,
         "supported_reasoning_efforts": ["low", "medium"],
         "service_tiers": ["standard"],
         "default_service_tier": "standard",
     },
-    # ── DeepSeek ───────────────────────────────────────────────────────
-    "deepseek/deepseek-reasoner": {
-        "name": "DeepSeek Reasoner",
-        "provider": "deepseek",
+    "openai/gpt-4-turbo": {
+        "name": "GPT-4 Turbo",
+        "provider": "openai",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "openai/gpt-4": {
+        "name": "GPT-4",
+        "provider": "openai",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "openai/gpt-3.5-turbo": {
+        "name": "GPT-3.5 Turbo",
+        "provider": "openai",
+        "hidden": True,
+        "supported_reasoning_efforts": ["low"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "openai/o1": {
+        "name": "OpenAI o1",
+        "provider": "openai",
         "hidden": False,
         "supported_reasoning_efforts": ["medium", "high"],
         "service_tiers": ["standard"],
         "default_service_tier": "standard",
     },
-    "deepseek/deepseek-chat": {
-        "name": "DeepSeek Chat",
+    "openai/o1-mini": {
+        "name": "OpenAI o1 Mini",
+        "provider": "openai",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "openai/o3": {
+        "name": "OpenAI o3",
+        "provider": "openai",
+        "hidden": False,
+        "supported_reasoning_efforts": ["medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "openai/o3-mini": {
+        "name": "OpenAI o3 Mini",
+        "provider": "openai",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "openai/o4-mini": {
+        "name": "OpenAI o4 Mini",
+        "provider": "openai",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    # ── DeepSeek ───────────────────────────────────────────────────────
+    "deepseek/deepseek-v4-flash": {
+        "name": "DeepSeek V4 Flash",
         "provider": "deepseek",
         "hidden": False,
         "supported_reasoning_efforts": ["low", "medium"],
@@ -112,6 +231,83 @@ _BUILTIN_MODELS: dict[str, dict[str, Any]] = {
     "moonshot/kimi-k2.5": {
         "name": "Kimi K2.5",
         "provider": "moonshot",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    # ── Gemini ──────────────────────────────────────────────────────────
+    "gemini/gemini-2.5-pro": {
+        "name": "Gemini 2.5 Pro",
+        "provider": "gemini",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "gemini/gemini-2.5-flash": {
+        "name": "Gemini 2.5 Flash",
+        "provider": "gemini",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "gemini/gemini-2.0-flash": {
+        "name": "Gemini 2.0 Flash",
+        "provider": "gemini",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    # ── DashScope (Qwen) ────────────────────────────────────────────────
+    "dashscope/qwen-max": {
+        "name": "Qwen Max",
+        "provider": "dashscope",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "dashscope/qwen-plus": {
+        "name": "Qwen Plus",
+        "provider": "dashscope",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    "dashscope/qwen-turbo": {
+        "name": "Qwen Turbo",
+        "provider": "dashscope",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    # ── Zhipu ───────────────────────────────────────────────────────────
+    "zhipu/glm-4": {
+        "name": "GLM-4",
+        "provider": "zhipu",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    # ── Moonshot ────────────────────────────────────────────────────────
+    "moonshot/kimi-k2": {
+        "name": "Kimi K2",
+        "provider": "moonshot",
+        "hidden": False,
+        "supported_reasoning_efforts": ["low", "medium", "high"],
+        "service_tiers": ["standard"],
+        "default_service_tier": "standard",
+    },
+    # ── MiniMax ─────────────────────────────────────────────────────────
+    "minimax/minimax-m1": {
+        "name": "MiniMax M1",
+        "provider": "minimax",
         "hidden": False,
         "supported_reasoning_efforts": ["low", "medium", "high"],
         "service_tiers": ["standard"],

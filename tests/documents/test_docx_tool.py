@@ -10,18 +10,21 @@ def test_imports():
 
 def test_docx_read_file_not_found():
     import asyncio
+
     from miqi.documents.docx_tool import DocxReadTool
 
     tool = DocxReadTool()
     result = asyncio.run(tool.execute(file_path="/nonexistent/doc.docx"))
     assert "Error" in result
-    assert "not found" in result
+    assert "不存在" in result
 
 
 def test_docx_read_valid_file():
     import asyncio
-    from miqi.documents.docx_tool import DocxReadTool
+
     from docx import Document
+
+    from miqi.documents.docx_tool import DocxReadTool
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "test.docx"
@@ -38,6 +41,7 @@ def test_docx_read_valid_file():
 
 def test_docx_write_creates_file():
     import asyncio
+
     from miqi.documents.docx_tool import DocxWriteTool
 
     with tempfile.TemporaryDirectory() as tmp:

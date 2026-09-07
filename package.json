@@ -1,11 +1,11 @@
 {
   "name": "miqi-desktop-release",
-  "version": "0.11.0",
+  "version": "0.25.0",
   "private": true,
-  "description": "Release tooling for MiQi Desktop",
+  "description": "Release tooling for MiQroForge Desktop",
   "repository": {
     "type": "git",
-    "url": "https://github.com/14790897/MiQi.git"
+    "url": "https://github.com/14790897/MiqroForge-Desktop.git"
   },
   "scripts": {
     "commit": "cz",
@@ -14,8 +14,11 @@
     "prepare": "husky"
   },
   "lint-staged": {
-    "apps/desktop/src/**/*.{ts,tsx}": "prettier --config apps/desktop/.prettierrc --write",
-    "apps/desktop/*.json": "prettier --config apps/desktop/.prettierrc --write"
+    "apps/desktop/src/**/*.{ts,tsx}": "prettier --config apps/desktop/.prettierrc --ignore-path apps/desktop/.prettierignore --write",
+    "apps/desktop/tests/**/*.{ts,tsx}": "prettier --config apps/desktop/.prettierrc --ignore-path apps/desktop/.prettierignore --write",
+    "apps/desktop/*.{ts,mjs,cjs,js}": "prettier --config apps/desktop/.prettierrc --ignore-path apps/desktop/.prettierignore --write",
+    "apps/desktop/scripts/*.{js,mjs,cjs}": "prettier --config apps/desktop/.prettierrc --ignore-path apps/desktop/.prettierignore --write",
+    "apps/desktop/!(package-lock).json": "prettier --config apps/desktop/.prettierrc --ignore-path apps/desktop/.prettierignore --write"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.6.0",
@@ -41,7 +44,14 @@
     ],
     "plugins": [
       "@semantic-release/commit-analyzer",
-      "@semantic-release/release-notes-generator",
+      [
+        "@semantic-release/release-notes-generator",
+        {
+          "writerOpts": {
+            "footerPartial": "{{#if noteGroups}}\n{{#each noteGroups}}\n\n### {{title}}\n\n{{#each notes}}\n* {{text}}\n{{/each}}\n{{/each}}\n{{/if}}\n---\n## 下载说明\n\nmacOS 用户请按芯片架构选择安装包：\n\n- **Apple Silicon (M1/M2/M3/M4)**：下载 `{{version}}-arm64.dmg`（ARM 架构）\n- **Intel**：下载 `{{version}}.dmg`（x86 无后缀）\n"
+          }
+        }
+      ],
       [
         "@semantic-release/changelog",
         {

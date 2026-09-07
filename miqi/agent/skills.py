@@ -4,10 +4,60 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Default builtin skills directory (relative to this file)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
+
+
+# 进程级技能索引缓存（#859）：让所有 SkillsLoader 实例共享「目录枚举 + frontmatter
+# 解析」结果，避免每次请求 / 每回合都重扫磁盘。key 含 workspace 与 builtin 目录，
+# 因为不同 workspace 的技能集合与解析结果不同。
+@dataclass
+class SkillIndex:
+    skills: list[dict[str, str]] | None = None  # None=未枚举；[]=已枚举但为空
+    meta_cache: dict[str, dict | None] = field(default_factory=dict)
+    references_cache: dict[str, list[str]] = field(default_factory=dict)
+    # 代际计数：每次 invalidate 递增，让长生命周期 SkillsLoader 能发现磁盘变更，
+    # 进而清空各自的实例级正文缓存（#859 评审）。
+    generation: int = 0
+
+
+_INDEX_CACHE: dict[tuple[str, str], SkillIndex] = {}
+
+
+def _index_key(workspace: Path, builtin_dir: Path | None) -> tuple[str, str]:
+    bd = builtin_dir or BUILTIN_SKILLS_DIR
+    return (str(Path(workspace).resolve()), str(Path(bd).resolve()))
+
+
+def get_skill_index(workspace: Path, builtin_dir: Path | None = None) -> SkillIndex:
+    """Return the shared SkillIndex for (workspace, builtin_dir), building an empty one lazily."""
+    key = _index_key(workspace, builtin_dir)
+    if key not in _INDEX_CACHE:
+        _INDEX_CACHE[key] = SkillIndex()
+    return _INDEX_CACHE[key]
+
+
+def invalidate_skill_index(workspace: Path | None = None) -> None:
+    """Reset cached skill indexes so the next access re-scans the disk.
+
+    Existing ``SkillsLoader`` instances keep their ``SkillIndex`` object but see
+    its contents reset, so even long-lived loaders (e.g. the per-session context)
+    pick up on-disk changes. With ``workspace=None`` every index is reset;
+    otherwise only entries whose workspace matches are reset.
+    """
+    if workspace is None:
+        targets = list(_INDEX_CACHE.values())
+    else:
+        ws = str(Path(workspace).resolve())
+        targets = [idx for key, idx in _INDEX_CACHE.items() if key[0] == ws]
+    for idx in targets:
+        idx.skills = None
+        idx.meta_cache.clear()
+        idx.references_cache.clear()
+        idx.generation += 1
 
 
 class SkillsLoader:
@@ -22,18 +72,60 @@ class SkillsLoader:
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+        # #729: metadata/content 缓存——一次摘要构建内同一技能被查 450 次，
+        # 每次无缓存都重读文件 + 全树 glob，实测单回合 5.7s。
+        # #859: meta_cache 提升为进程级共享（所有实例共享 frontmatter 解析结果）；
+        # 正文 content_cache 仍保持实例级（渐进式披露，正文按需读取）。
+        self._index = get_skill_index(workspace, self.builtin_skills)
+        self._meta_cache: dict[str, dict | None] = self._index.meta_cache
+        self._content_cache: dict[str, str | None] = {}
+        # nested 技能 name→SKILL.md 索引（懒构建，替代 load_skill 里的全树 glob）
+        self._nested_index: dict[str, Path] | None = None
+        # 进程级索引的代际快照——检测磁盘变更，变了就清本实例的正文缓存
+        self._index_generation = self._index.generation
 
-    def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
+    def _sync_index_generation(self) -> None:
+        """Drop instance-level caches when the shared index was invalidated.
+
+        ``invalidate_skill_index`` bumps ``SkillIndex.generation`` (e.g. after a
+        skill create/upload/delete). A long-lived loader keeps its own
+        ``_content_cache``, so without this it would keep serving deleted skill
+        bodies from memory (#859 评审).
         """
-        List all available skills.
+        if self._index.generation != self._index_generation:
+            self._content_cache.clear()
+            self._nested_index = None
+            self._index_generation = self._index.generation
 
-        Args:
-            filter_unavailable: If True, filter out skills with unmet requirements.
+    def _get_nested_index(self) -> dict[str, Path]:
+        """Build (once) a name → SKILL.md path index for nested builtin skills.
 
-        Returns:
-            List of skill info dicts with 'name', 'path', 'source'.
+        Replaces the per-lookup ``glob("**/<name>/SKILL.md")`` which walks the
+        whole builtin tree on every call (issue #729: 1100 globs / 5.7s per
+        turn). Mirrors ``_discover_nested_skills`` depth: flat dirs plus up to
+        2 levels of nesting.
         """
-        skills = []
+        if self._nested_index is None:
+            index: dict[str, Path] = {}
+            if self.builtin_skills and self.builtin_skills.exists():
+                for entry in sorted(self.builtin_skills.rglob("SKILL.md")):
+                    rel = entry.relative_to(self.builtin_skills)
+                    # _discover_nested_skills 深度上限：最多 4 层目录 + SKILL.md
+                    if len(rel.parts) <= 5:
+                        index.setdefault(entry.parent.name, entry)
+            self._nested_index = index
+        return self._nested_index
+
+    def _enumerate_skills(self) -> list[dict[str, str]]:
+        """Enumerate skill dirs (name/path/source) once per (workspace, builtin).
+
+        Cached in the process-level SkillIndex so every SkillsLoader instance
+        shares the directory scan (#859).
+        """
+        if self._index.skills is not None:
+            return self._index.skills
+
+        skills: list[dict[str, str]] = []
 
         # Workspace skills (highest priority)
         if self.workspace_skills.exists():
@@ -52,6 +144,21 @@ class SkillsLoader:
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
                     # Recursively discover nested skills (e.g. kwp/<plugin>/<skill>/SKILL.md)
                     self._discover_nested_skills(skill_dir, skills, source="builtin")
+
+        self._index.skills = skills
+        return skills
+
+    def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
+        """
+        List all available skills.
+
+        Args:
+            filter_unavailable: If True, filter out skills with unmet requirements.
+
+        Returns:
+            List of skill info dicts with 'name', 'path', 'source'.
+        """
+        skills = list(self._enumerate_skills())
 
         # Filter out archived skills
         skills = [s for s in skills if not self._is_skill_archived(s["name"])]
@@ -118,9 +225,9 @@ class SkillsLoader:
                 return builtin_skill
 
         # Search nested built-in skills (e.g. kwp/<plugin>/<skill>/SKILL.md)
-        if self.builtin_skills:
-            for entry in self.builtin_skills.glob("**/" + name + "/SKILL.md"):
-                return entry
+        entry = self._get_nested_index().get(name)
+        if entry is not None:
+            return entry
 
         return None
 
@@ -134,6 +241,15 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
+        self._sync_index_generation()
+        if name in self._content_cache:
+            return self._content_cache[name]
+
+        content = self._load_skill_uncached(name)
+        self._content_cache[name] = content
+        return content
+
+    def _load_skill_uncached(self, name: str) -> str | None:
         # Check workspace first
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
@@ -145,10 +261,10 @@ class SkillsLoader:
             if builtin_skill.exists():
                 return builtin_skill.read_text(encoding="utf-8")
 
-        # Check built-in (nested — kwp/<plugin>/<skill>/SKILL.md)
-        if self.builtin_skills:
-            for entry in self.builtin_skills.glob("**/" + name + "/SKILL.md"):
-                return entry.read_text(encoding="utf-8")
+        # Check built-in (nested — kwp/<plugin>/<skill>/SKILL.md) via index
+        entry = self._get_nested_index().get(name)
+        if entry is not None:
+            return entry.read_text(encoding="utf-8")
 
         return None
 
@@ -171,7 +287,7 @@ class SkillsLoader:
 
         return "\n\n---\n\n".join(parts) if parts else ""
 
-    def build_skills_summary(self) -> str:
+    def build_skills_summary(self, description_max_chars: int | None = None) -> str:
         """
         Build a summary of all skills (name, description, path, availability).
 
@@ -187,6 +303,11 @@ class SkillsLoader:
         agent can read them with relative paths. This matches the Claude
         Code / Cowork convention of `pdf/SKILL.md`-style locations.
 
+        Args:
+            description_max_chars: When set, truncate each skill description
+                to this many characters (cut at the last sentence boundary
+                within budget) to keep the injected summary compact.
+
         Returns:
             XML-formatted skills summary.
         """
@@ -196,6 +317,20 @@ class SkillsLoader:
 
         def escape_xml(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        def truncate_description(desc: str) -> str:
+            """Trim to description_max_chars at a sentence boundary."""
+            if description_max_chars is None or len(desc) <= description_max_chars:
+                return desc
+            cut = desc[:description_max_chars]
+            best = -1
+            for sep in (". ", "。", "！", "! ", "？", "? "):
+                idx = cut.rfind(sep)
+                if idx > best:
+                    best = idx
+            if best > description_max_chars * 0.5:
+                cut = cut[: best + 1].rstrip()
+            return cut + "…"
 
         def relative_path(absolute: str) -> str:
             """Convert absolute SKILL.md path to a short relative path.
@@ -221,7 +356,7 @@ class SkillsLoader:
         for s in all_skills:
             name = escape_xml(s["name"])
             rel_path = relative_path(s["path"])
-            desc = escape_xml(self._get_skill_description(s["name"]))
+            desc = escape_xml(truncate_description(self._get_skill_description(s["name"])))
             skill_meta = self._get_skill_meta(s["name"])
             available = self._check_requirements(skill_meta)
 
@@ -232,9 +367,12 @@ class SkillsLoader:
 
             # Surface references/ siblings so the agent knows there's a
             # third layer (Anthropic's progressive-disclosure level 3).
-            skill_dir = Path(s["path"]).parent
-            refs = sorted(p.name for p in skill_dir.glob("*.md")
-                          if p.name.lower() != "skill.md")
+            refs = self._index.references_cache.get(s["name"])
+            if refs is None:
+                skill_dir = Path(s["path"]).parent
+                refs = sorted(p.name for p in skill_dir.glob("*.md")
+                              if p.name.lower() != "skill.md")
+                self._index.references_cache[s["name"]] = refs
             if refs:
                 lines.append("    <references>" +
                              ", ".join(escape_xml(r) for r in refs) +
@@ -324,6 +462,14 @@ class SkillsLoader:
         Returns:
             Metadata dict or None.
         """
+        if name in self._meta_cache:
+            return self._meta_cache[name]
+
+        metadata = self._load_skill_metadata_uncached(name)
+        self._meta_cache[name] = metadata
+        return metadata
+
+    def _load_skill_metadata_uncached(self, name: str) -> dict | None:
         content = self.load_skill(name)
         if not content:
             return None

@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Save, Loader2, Radio, ToggleLeft, ToggleRight } from 'lucide-react';
 import { cn } from '../../lib/utils';
-import { useRestartRequired } from '../../contexts/RestartRequiredContext';
 import type { ChannelsConfig } from '../../../shared/ipc';
 
 // ─── Feature flags ───────────────────────────────────────────────────────────
@@ -74,7 +73,7 @@ function FieldRow({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
-          className="w-full px-3 py-2 rounded-lg text-sm bg-[var(--surface-muted)] border border-[var(--border-subtle)] text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none focus:border-[var(--accent)] font-mono"
+          className="w-full px-3 py-2 rounded-lg text-sm bg-[var(--surface-muted)] border border-[var(--border-subtle)] text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none focus:border-[var(--border-strong)] font-mono"
           autoComplete="off"
           spellCheck={false}
         />
@@ -174,7 +173,7 @@ function FeishuSection({ config, onChange }: FeishuSectionProps) {
             }
             rows={3}
             placeholder="ou_xxxxxxxxxxxxxxxx"
-            className="w-full px-3 py-2 rounded-lg text-sm bg-[var(--surface-muted)] border border-[var(--border-subtle)] text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none focus:border-[var(--accent)] font-mono resize-none"
+            className="w-full px-3 py-2 rounded-lg text-sm bg-[var(--surface-muted)] border border-[var(--border-subtle)] text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none focus:border-[var(--border-strong)] font-mono resize-none"
             spellCheck={false}
           />
         </div>
@@ -187,7 +186,7 @@ function FeishuSection({ config, onChange }: FeishuSectionProps) {
             min={0}
             value={config.reply_delay_ms}
             onChange={(e) => set('reply_delay_ms', Number(e.target.value))}
-            className="w-40 px-3 py-2 rounded-lg text-sm bg-[var(--surface-muted)] border border-[var(--border-subtle)] text-[var(--text)] focus:outline-none focus:border-[var(--accent)] tabular-nums"
+            className="w-40 px-3 py-2 rounded-lg text-sm bg-[var(--surface-muted)] border border-[var(--border-subtle)] text-[var(--text)] focus:outline-none focus:border-[var(--border-strong)] tabular-nums"
           />
           <p className="text-xs text-[var(--text-faint)]">消息合并窗口时间，0 表示关闭</p>
         </div>
@@ -206,7 +205,6 @@ function FeishuSection({ config, onChange }: FeishuSectionProps) {
 
 // ─── Main page ────────────────────────────────────────────────────────────────
 export function ChannelsPage() {
-  const { markRestartRequired } = useRestartRequired();
   const [config, setConfig] = useState<ChannelsConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -237,7 +235,6 @@ export function ChannelsPage() {
     try {
       await window.miqi.channels.update(config as unknown as Record<string, unknown>);
       setSaved(true);
-      markRestartRequired();
       setTimeout(() => setSaved(false), 2000);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Save failed');
@@ -277,7 +274,7 @@ export function ChannelsPage() {
         ) : !config ? (
           <div className="flex flex-col items-center justify-center h-40 gap-2 text-sm text-[var(--text-faint)]">
             <Radio size={24} />
-            <span>MiQi 运行时未启动</span>
+            <span>MiQroForge 运行时未启动</span>
           </div>
         ) : (
           <>

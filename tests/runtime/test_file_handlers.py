@@ -10,7 +10,6 @@ Validates:
 
 import pytest
 
-
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -67,7 +66,7 @@ async def test_files_tree_workspace_only(fake_config, fake_provider, tmp_path):
 @pytest.mark.asyncio
 async def test_files_tree_session_scoped_requires_claim(fake_config, fake_provider, tmp_path):
     """files.tree with unowned session_key returns REQUIRES_CLAIM."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_tree_handler
 
     # Create an unowned session on disk (no owner_client_id)
@@ -106,7 +105,7 @@ async def test_files_read_own_file_succeeds(fake_config, fake_provider, tmp_path
 @pytest.mark.asyncio
 async def test_files_read_cross_client_rejected(fake_config, fake_provider, tmp_path):
     """files.read by client-B on client-A's session returns UNAUTHORIZED."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_read_handler
 
     sm, ws = _setup_session("x-read-a", "client-A")
@@ -125,7 +124,7 @@ async def test_files_read_cross_client_rejected(fake_config, fake_provider, tmp_
 @pytest.mark.asyncio
 async def test_files_read_unowned_legacy_requires_claim(fake_config, fake_provider, tmp_path):
     """files.read on unowned legacy session returns REQUIRES_CLAIM."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_read_handler
 
     sm, ws = _setup_session("legacy-read-unowned", None, set_owner=False)
@@ -144,7 +143,7 @@ async def test_files_read_unowned_legacy_requires_claim(fake_config, fake_provid
 @pytest.mark.asyncio
 async def test_files_read_missing_path(fake_config, fake_provider, tmp_path):
     """files.read rejects missing path parameter."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_read_handler
 
     registry = ClientSessionRegistry()
@@ -181,7 +180,7 @@ async def test_files_write_own_session_succeeds(fake_config, fake_provider, tmp_
 @pytest.mark.asyncio
 async def test_files_write_cross_client_rejected(fake_config, fake_provider, tmp_path):
     """files.write by client-B on client-A's session returns UNAUTHORIZED."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_write_handler
 
     _setup_session("write-cross", "client-A")
@@ -199,7 +198,7 @@ async def test_files_write_cross_client_rejected(fake_config, fake_provider, tmp
 @pytest.mark.asyncio
 async def test_files_write_unowned_legacy_rejected(fake_config, fake_provider, tmp_path):
     """files.write on unowned legacy session returns REQUIRES_CLAIM (no auto-claim)."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_write_handler
 
     _setup_session("write-legacy-unowned", None, set_owner=False)
@@ -220,7 +219,7 @@ async def test_files_write_unowned_legacy_rejected(fake_config, fake_provider, t
 @pytest.mark.asyncio
 async def test_files_delete_cross_client_rejected(fake_config, fake_provider, tmp_path):
     """files.delete by client-B on client-A's session returns UNAUTHORIZED."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_delete_handler
 
     sm, ws = _setup_session("delete-cross", "client-A")
@@ -242,7 +241,7 @@ async def test_files_delete_cross_client_rejected(fake_config, fake_provider, tm
 @pytest.mark.asyncio
 async def test_files_diff_cross_client_rejected(fake_config, fake_provider, tmp_path):
     """files.diff by client-B on client-A's session returns UNAUTHORIZED."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_diff_handler
 
     _setup_session("diff-cross", "client-A")
@@ -263,7 +262,7 @@ async def test_files_diff_cross_client_rejected(fake_config, fake_provider, tmp_
 @pytest.mark.asyncio
 async def test_files_revert_cross_client_rejected(fake_config, fake_provider, tmp_path):
     """files.revert by client-B on client-A's session returns UNAUTHORIZED."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_revert_handler
 
     _setup_session("revert-cross", "client-A")
@@ -285,8 +284,9 @@ async def test_files_revert_uses_session_manager_not_undefined_function():
     The handler must NOT reference the previously undefined _remove_tracked_file
     symbol. It should use SessionManager.remove_tracked_file with client_id.
     """
-    from miqi.runtime.file_handlers import files_revert_handler
     import inspect
+
+    from miqi.runtime.file_handlers import files_revert_handler
 
     source = inspect.getsource(files_revert_handler)
     # The handler must not call bare _remove_tracked_file(...)
@@ -322,7 +322,7 @@ async def test_files_accept_updates_tracked_files_with_client_id(fake_config, fa
 @pytest.mark.asyncio
 async def test_files_accept_cross_client_rejected(fake_config, fake_provider, tmp_path):
     """files.accept by client-B on client-A's session returns UNAUTHORIZED."""
-    from miqi.runtime.app_server import ClientSessionRegistry, AppServerError
+    from miqi.runtime.app_server import AppServerError, ClientSessionRegistry
     from miqi.runtime.file_handlers import files_accept_handler
 
     _setup_session("accept-cross", "client-A")
@@ -344,6 +344,7 @@ async def test_files_accept_cross_client_rejected(fake_config, fake_provider, tm
 async def test_sandbox_manager_client_scoped_keys():
     """Same session_key under different clients maps to different sandbox keys."""
     from pathlib import Path
+
     from miqi.sandbox.manager import SandboxManager
 
     manager = SandboxManager(workspace=Path("."), enabled=False)
@@ -391,3 +392,107 @@ def test_appserver_has_all_file_handlers():
         assert hasattr(file_handlers, name), f"Missing handler: {name}"
         handler = getattr(file_handlers, name)
         assert callable(handler), f"Handler {name} is not callable"
+
+
+@pytest.mark.asyncio
+async def test_files_read_image_returns_base64_and_mime(fake_config, fake_provider, tmp_path):
+    """files.read on an image returns base64 + image mime — OCR 附件恢复链路 (#659)."""
+    from miqi.runtime.app_server import ClientSessionRegistry
+    from miqi.runtime.file_handlers import files_read_handler
+
+    sm, ws = _setup_session("img-reader", "client-1")
+    files_dir = ws / "sessions" / "img-reader" / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    # Minimal PNG: 8-byte signature + 16 zero bytes payload
+    (files_dir / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+    registry = ClientSessionRegistry()
+    result = await files_read_handler(
+        "req-img",
+        {"path": "photo.png", "session_key": "img-reader"},
+        "client-1", None, registry,
+    )
+    r = result["result"]
+    assert r["is_binary"] is True
+    assert r["mime_type"] == "image/png"
+    assert r["data_base64"].startswith("iVBORw0KGgo")  # PNG magic bytes
+    assert r["size"] == 24
+
+
+@pytest.mark.asyncio
+async def test_files_read_svg_returns_base64_and_mime(fake_config, fake_provider, tmp_path):
+    """files.read on .svg 走二进制分支（data_base64 + image/svg+xml）。
+
+    回归（CodeRabbit #761）：svg 同时属文本安全集与二进制可读集，
+    文本分支先命中会返回纯文本 content，前端 [Image:] 内联展示拿不到 bytes。
+    """
+    from miqi.runtime.app_server import ClientSessionRegistry
+    from miqi.runtime.file_handlers import files_read_handler
+
+    sm, ws = _setup_session("svg-reader", "client-1")
+    files_dir = ws / "sessions" / "svg-reader" / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    svg_body = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>'
+    (files_dir / "step-graph.svg").write_text(svg_body, encoding="utf-8")
+
+    registry = ClientSessionRegistry()
+    result = await files_read_handler(
+        "req-svg",
+        {"path": "step-graph.svg", "session_key": "svg-reader"},
+        "client-1", None, registry,
+    )
+    r = result["result"]
+    assert r["is_binary"] is True
+    assert r["mime_type"] == "image/svg+xml"
+    assert r["data_base64"]  # base64 非空
+    assert "content" not in r  # 不走文本分支
+
+
+@pytest.mark.asyncio
+async def test_files_read_svg_as_text_returns_content(fake_config, fake_provider, tmp_path):
+    """files.read on .svg + as_text=true 走文本分支（#776）。
+
+    svg 同时属文本安全集与二进制可读集，默认二进制（前端内联展示）；
+    as_text=true 时显式请求纯文本，agent 可读 svg 源码。
+    """
+    from miqi.runtime.app_server import ClientSessionRegistry
+    from miqi.runtime.file_handlers import files_read_handler
+
+    sm, ws = _setup_session("svg-text", "client-1")
+    files_dir = ws / "sessions" / "svg-text" / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    svg_body = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>'
+    (files_dir / "step-graph.svg").write_text(svg_body, encoding="utf-8")
+
+    registry = ClientSessionRegistry()
+    result = await files_read_handler(
+        "req-svg-text",
+        {"path": "step-graph.svg", "session_key": "svg-text", "as_text": True},
+        "client-1", None, registry,
+    )
+    r = result["result"]
+    assert "data_base64" not in r  # 不走二进制分支
+    assert r["content"] == svg_body  # 纯文本内容
+    assert r["size"] == len(svg_body)
+
+
+@pytest.mark.asyncio
+async def test_files_read_image_jpg_mime(fake_config, fake_provider, tmp_path):
+    """files.read on a .jpg maps to image/jpeg (#659)."""
+    from miqi.runtime.app_server import ClientSessionRegistry
+    from miqi.runtime.file_handlers import files_read_handler
+
+    sm, ws = _setup_session("jpg-reader", "client-1")
+    files_dir = ws / "sessions" / "jpg-reader" / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    (files_dir / "shot.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+
+    registry = ClientSessionRegistry()
+    result = await files_read_handler(
+        "req-jpg",
+        {"path": "shot.jpg", "session_key": "jpg-reader"},
+        "client-1", None, registry,
+    )
+    r = result["result"]
+    assert r["is_binary"] is True
+    assert r["mime_type"] == "image/jpeg"

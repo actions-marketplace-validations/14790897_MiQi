@@ -7,7 +7,6 @@ from typer.testing import CliRunner
 
 from miqi.cli.commands import app
 from miqi.config.schema import Config
-from miqi.providers.registry import find_by_model
 
 runner = CliRunner()
 
@@ -109,7 +108,7 @@ def test_status_with_existing_config_no_crash(monkeypatch, tmp_path):
     result = runner.invoke(app, ["status"])
 
     assert result.exit_code == 0
-    assert "MiQi Status" in result.stdout
+    assert "MiQroForge Status" in result.stdout
     assert "OpenRouter" in result.stdout
 
 
@@ -130,8 +129,6 @@ def test_agent_command_passes_runtime_configs(monkeypatch, tmp_path):
     config.providers.openrouter.api_key = "sk-or-v1-test"
     config.agents.defaults.workspace = str(tmp_path / "workspace")
     (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
-
-    captured: dict = {}
 
     class FakeCronService:
         def __init__(self, _store_path, **kwargs):
@@ -256,7 +253,7 @@ def test_interactive_onboard_configures_papers_and_skips_feishu(monkeypatch):
 
     assert agent_name == "miqi"
     assert soul == "balanced"
-    assert config.tools.web.search.provider == "ddgs"
+    assert config.tools.web.search.provider == "auto"  # #561: mode 1 = auto 回落链
     assert config.tools.web.search.api_key == ""
     assert config.tools.papers.provider == "hybrid"
     assert config.tools.papers.timeout_seconds == 20

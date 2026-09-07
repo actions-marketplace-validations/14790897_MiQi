@@ -12,11 +12,23 @@ export interface MockBridgeOptions {
   sessionMessages?: Record<string, unknown[]>;
   preloadOk?: boolean;
   providers?: Array<Record<string, unknown>>;
+  /** model/list 目录（issue #788）。默认含 deepseek + openai + custom，供过滤逻辑验证。 */
+  models?: Array<Record<string, unknown>>;
   activeModel?: string;
   activeProvider?: string | null;
   config?: Record<string, unknown>;
+  /** MiQroForge 登录态（issue #726 设置页）。默认未登录。 */
+  qraftStatus?: Record<string, unknown>;
+  /** qraft.login 的返回结果。默认登录成功。 */
+  qraftLoginResult?: Record<string, unknown>;
+  /** 登录成功后的状态（login 成功时写入）。 */
+  qraftLoggedInStatus?: Record<string, unknown>;
+  /** qraft.pointsBalance 的返回结果。默认成功返回 270 可用积分。 */
+  qraftPointsResult?: Record<string, unknown>;
 }
 
+/** Build a self-contained init script that installs the mock bridge on
+ *  `window.miqi` and exposes `window.__miqiMock` for tests to fire events. */
 export function buildMockBridgeScript(opts: MockBridgeOptions = {}): string {
   const runtimeStatus = opts.runtimeStatus || 'running';
   const preloadOk = opts.preloadOk !== false;
@@ -32,14 +44,84 @@ export function buildMockBridgeScript(opts: MockBridgeOptions = {}): string {
   const sessionsJson = JSON.stringify(initialSessions);
   const sessionMessagesJson = JSON.stringify(opts.sessionMessages || {});
   const providersJson = JSON.stringify(opts.providers || []);
+  const modelsJson = JSON.stringify(
+    opts.models || [
+      {
+        id: 'deepseek/deepseek-v4-flash',
+        name: 'DeepSeek V4 Flash',
+        provider: 'deepseek',
+        providerDisplayName: 'DeepSeek',
+        hidden: false,
+        default: false,
+      },
+      {
+        id: 'openai/gpt-4o',
+        name: 'GPT-4o',
+        provider: 'openai',
+        providerDisplayName: 'OpenAI',
+        hidden: false,
+        default: false,
+      },
+      {
+        id: 'custom/my-model',
+        name: 'My Model',
+        provider: 'custom',
+        providerDisplayName: 'Custom',
+        hidden: false,
+        default: false,
+      },
+    ]
+  );
   const activeModelJson = JSON.stringify(opts.activeModel || '');
   const activeProviderJson = JSON.stringify(opts.activeProvider ?? null);
   const configJson = JSON.stringify(opts.config || {});
+  const qraftStatusJson = JSON.stringify(opts.qraftStatus || { loggedIn: false });
+  const qraftLoginResultJson = JSON.stringify(
+    opts.qraftLoginResult || {
+      ok: true,
+      account: {
+        phone: '18500000000',
+        sub: '19',
+        username: 'U-HKY4-GB4E',
+        nickname: 'MiQi测试',
+      },
+    }
+  );
+  const qraftLoggedInStatusJson = JSON.stringify(
+    opts.qraftLoggedInStatus || {
+      loggedIn: true,
+      account: {
+        phone: '18500000000',
+        sub: '19',
+        username: 'U-HKY4-GB4E',
+        nickname: 'MiQi测试',
+      },
+      env: 'test',
+      baseUrl: 'https://test.forge.miqroera.com/api',
+      expiresAt: Date.now() + 7_199_000,
+      refreshScheduledAt: Date.now() + 6_299_000,
+      // #922：登录态默认网关已开通（active），模型面板/发送门禁放行。
+      aiGateway: { status: 'active', configVersion: 1 },
+    }
+  );
+  const qraftPointsResultJson = JSON.stringify(
+    opts.qraftPointsResult || {
+      ok: true,
+      points: { availablePoints: 270, heldPoints: 0, totalEarned: 300, totalSpent: 30 },
+    }
+  );
 
   return `
 (function() {
   if (typeof window === 'undefined') return;
   if (!${preloadOk}) return;
+
+  // #837 隐私确认门：smoke 场景预置已同意状态（addInitScript 先于应用代码
+  // 执行，localStorage 可用）。隐私门自身的交互由 e2e/privacy-consent.spec.ts
+  // 覆盖。
+  try {
+    localStorage.setItem('miqi:privacyConsentVersion', '1.0');
+  } catch (e) {}
 
   // Polyfill requestAnimationFrame with setTimeout so the ChatConsole
   // typewriter animation completes instantly in headless Playwright.
@@ -53,11 +135,26 @@ export function buildMockBridgeScript(opts: MockBridgeOptions = {}): string {
   var noop = function() { return function() {}; };
   var _config = ${configJson};
   var _configUpdates = [];
+  var _modelCatalog = ${modelsJson};
+  // 动态 provider 状态：update/activate/deactivate 会修改，镜像真实后端行为
+  // （#929 修复分支的 E2E 评估依赖这一动态性）。
+  var _providers = ${providersJson};
+  var _activeModel = ${activeModelJson};
+  var _activeProvider = ${activeProviderJson};
 
   // ── Interactive helpers ──────────────────────────────────────────
-  var _callbacks = { progress: [], final: [], error: [], aborted: [], log: [] };
+  var _callbacks = {
+    progress: [],
+    final: [],
+    error: [],
+    aborted: [],
+    log: [],
+    qraftStatus: [],
+    'config:updated': [],
+  };
 
   function _on(type, cb) {
+    if (!_callbacks[type]) _callbacks[type] = [];
     _callbacks[type].push(cb);
     return function() {
       _callbacks[type] = _callbacks[type].filter(function(f) { return f !== cb; });
@@ -76,6 +173,9 @@ export function buildMockBridgeScript(opts: MockBridgeOptions = {}): string {
     '[2026-07-07T10:00:05.000Z] [WARN] [bridge] Slow IPC response: sessions.list (850ms)',
     '[2026-07-07T10:00:10.000Z] [ERROR] [sandbox] Sandbox timeout after 30s',
   ];
+
+  // ── MiQroForge 登录态（issue #726，login/logout 会变更并推送状态事件） ──
+  var _qraftStatus = ${qraftStatusJson};
 
   // ── window.miqi ──────────────────────────────────────────────────
 
@@ -159,14 +259,62 @@ export function buildMockBridgeScript(opts: MockBridgeOptions = {}): string {
       get: function() { return Promise.resolve(JSON.parse(JSON.stringify(_config))); },
       update: function(payload) {
         _configUpdates.push(JSON.parse(JSON.stringify(payload)));
+        // 镜像真实后端：默认模型经 config.update 修改后立即反映到 providers.list
+        var model = payload && payload.agents && payload.agents.defaults && payload.agents.defaults.model;
+        if (model) _activeModel = model;
         return Promise.resolve({});
+      },
+      // #897 ConfigHotReloadListener subscribes on mount; return an unsubscribe.
+      onUpdated: function(cb) { return _on('config:updated', cb); },    },
+
+    providers: {
+      list: function() { return Promise.resolve({ providers: JSON.parse(JSON.stringify(_providers)), active_model: _activeModel, active_provider: _activeProvider }); },
+      test: function() { return Promise.resolve({ ok: true }); },
+      update: function(providerName, apiKey, apiBase, headers, model) {
+        // 镜像真实后端：model 覆盖写为默认模型，并归属 provider
+        if (model) {
+          _activeModel = model;
+          _activeProvider = providerName;
+          for (var i = 0; i < _providers.length; i++) {
+            if (_providers[i].name === providerName) _providers[i].configured_model = model;
+          }
+        }
+        return Promise.resolve({ ok: true });
+      },
+      activate: function(providerName) {
+        for (var i = 0; i < _providers.length; i++) {
+          if (_providers[i].name === providerName) {
+            _providers[i].builtin_activated = true;
+            _providers[i].configured = true;
+          }
+        }
+        return Promise.resolve({ activated: true, provider_name: providerName });
+      },
+      deactivate: function(providerName) {
+        for (var i = 0; i < _providers.length; i++) {
+          if (_providers[i].name === providerName) {
+            _providers[i].builtin_activated = false;
+            _providers[i].configured = false;
+            _providers[i].configured_model = null;
+          }
+        }
+        // 镜像真实后端：默认模型归属被取消激活的 provider 时重置为可用
+        // 模型或清空为「未选择」（#929 / #933）
+        if (_activeProvider === providerName) {
+          _activeModel = '';
+          _activeProvider = null;
+        }
+        return Promise.resolve({ deactivated: true, provider_name: providerName });
       },
     },
 
-    providers: {
-      list: function() { return Promise.resolve({ providers: ${providersJson}, active_model: ${activeModelJson}, active_provider: ${activeProviderJson} }); },
-      test: function() { return Promise.resolve({ ok: true }); },
-      update: function() { return Promise.resolve({ ok: true }); },
+    models: {
+      list: function() { return Promise.resolve({ models: JSON.parse(JSON.stringify(_modelCatalog)) }); },
+    },
+
+    models: {
+      // 空目录 → ModelSelect 回退 FALLBACK_MODEL_PRESETS（内置 DeepSeek 下拉）。
+      list: function() { return Promise.resolve({ models: [] }); },
     },
 
     channels: {
@@ -242,6 +390,38 @@ export function buildMockBridgeScript(opts: MockBridgeOptions = {}): string {
     dialog: {
       openFile: function() { return Promise.resolve({ canceled: true }); },
     },
+
+    // -- MiQroForge 平台 OAuth2 登录 (issue #726) ------------------------------
+    qraft: {
+      login: function(phone, password, opts) {
+        var result = JSON.parse(JSON.stringify(${qraftLoginResultJson}));
+        if (result.ok) {
+          _qraftStatus = JSON.parse(JSON.stringify(${qraftLoggedInStatusJson}));
+          setTimeout(function() { _fire('qraftStatus', _qraftStatus); }, 0);
+        }
+        return Promise.resolve(result);
+      },
+      browserLogin: function(opts) {
+        var result = JSON.parse(JSON.stringify(${qraftLoginResultJson}));
+        if (result.ok) {
+          _qraftStatus = JSON.parse(JSON.stringify(${qraftLoggedInStatusJson}));
+          setTimeout(function() { _fire('qraftStatus', _qraftStatus); }, 0);
+        }
+        return Promise.resolve(result);
+      },
+      status: function() { return Promise.resolve(JSON.parse(JSON.stringify(_qraftStatus))); },
+      refresh: function() { return Promise.resolve({ ok: true }); },
+      logout: function() {
+        _qraftStatus = { loggedIn: false };
+        setTimeout(function() { _fire('qraftStatus', _qraftStatus); }, 0);
+        return Promise.resolve({ ok: true });
+      },
+      pointsBalance: function() {
+        return Promise.resolve(JSON.parse(JSON.stringify(${qraftPointsResultJson})));
+      },
+      billingHistory: function() { return Promise.resolve([]); },
+      onStatusChanged: function(cb) { return _on('qraftStatus', cb); },
+    },
   };
 
   // ── Trigger API (for tests) ──────────────────────────────────────
@@ -309,7 +489,7 @@ export function buildMockBridgeScript(opts: MockBridgeOptions = {}): string {
 
     /** Clear all registered callbacks */
     reset: function() {
-      _callbacks = { progress: [], final: [], error: [], aborted: [], log: [] };
+      _callbacks = { progress: [], final: [], error: [], aborted: [], log: [], qraftStatus: [] };
     },
 
     getConfigUpdates: function() {

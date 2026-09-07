@@ -41,8 +41,8 @@ Produce a before/after process comparison with specific improvement recommendati
 
 ---
 
-## Using This Skill with MiQi
+## Using This Skill with MiQroForge
 
-MiQi includes built-in tools that cover most standalone needs: `web_search`, `web_fetch`, `read_file`, `write_file`, `edit_file`, `create_docx`, `create_pptx`, `create_xlsx`, `create_pdf`, `exec`.
+MiQroForge includes built-in tools that cover most standalone needs: `web_search`, `web_fetch`, `read_file`, `write_file`, `edit_file`, `create_docx`, `create_pptx`, `create_xlsx`, `create_pdf`, `exec`.
 
-To add MCP connectors for supercharged mode, configure MCP servers in MiQi's MCP settings page or add them via `config.json`.
+To add MCP connectors for supercharged mode, configure MCP servers in MiQroForge's MCP settings page or add them via `config.json`.

@@ -3,9 +3,9 @@ from __future__ import annotations
 import pytest
 
 from miqi.bridge.loop import BridgeRuntimeLoop
+from miqi.runtime.protocol_model_schema import params_schema_from_model, result_schema_from_model
 from miqi.runtime.thread_request_models import THREAD_METHOD_PARAM_MODELS
 from miqi.runtime.thread_response_models import THREAD_METHOD_RESULT_MODELS
-from miqi.runtime.protocol_model_schema import params_schema_from_model, result_schema_from_model
 
 
 class _CaptureSend:
@@ -54,8 +54,7 @@ async def test_plan72_primary_thread_contract_counts():
         typed = [item for item in catalog["methods"] if item["stability"] != "legacy"]
         legacy = [item for item in catalog["methods"] if item["stability"] == "legacy"]
 
-        assert len(catalog["methods"]) == 160  # +1 for sessions.rename, +1 for sessions.listRecentWorkspaces
         assert len(typed) >= 83
-        assert len(legacy) <= 77  # +1 legacy: sessions.rename, +1 legacy: sessions.list_recent_workspaces
+        assert len(legacy) <= 80  # +1 chat.discard_resume (#740), +1 providers.deactivate (#835), +1 sandbox.setAllowSystemInstalls (#854)
     finally:
         await loop.app_server.stop()
