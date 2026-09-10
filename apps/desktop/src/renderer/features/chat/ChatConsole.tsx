@@ -18,6 +18,8 @@ import { renderContent } from './components/renderContent';
 import { TrackedFileCard } from './components/TrackedFileCard';
 import { ConfirmCardArea } from './components/ConfirmCardArea';
 import { TurnStatusBar } from './components/TurnStatusBar';
+import { QraftLoginButton, QraftLoginCard } from '../settings/components/QraftLoginCard';
+import { useQraftStatus } from '../../hooks/useQraftStatus';
 import { ToolCommandBlock } from './components/ToolCommandBlock';
 import { useUserInput } from '../../contexts/UserInputContext';
 import { ErrorBoundary } from '../../components/ErrorBoundary';
@@ -248,7 +250,7 @@ interface Message {
   toolData?: unknown;
   /** Original tool-call arguments (e.g. web_fetch's url) — real references */
   toolArgs?: unknown;
-  action?: 'open-provider-settings' | 'retry-load';
+  action?: 'open-provider-settings' | 'retry-load' | 'login';
   actionLabel?: string;
   /** When true the message is collapsed by default (user can click to expand) */
   collapsed?: boolean;
@@ -448,12 +450,16 @@ function isProviderConfigurationProblem(message: string, code?: string) {
   );
 }
 
-function createProviderConfigMessage(content?: string): Message {
+function createProviderConfigMessage(
+  content?: string,
+  action: 'open-provider-settings' | 'login' = 'open-provider-settings',
+  actionLabel?: string
+): Message {
   return {
     role: 'error',
     content: content || '尚未配置模型服务。请先配置 Provider/API Key 后再发送消息。',
-    action: 'open-provider-settings',
-    actionLabel: '去配置模型',
+    action,
+    actionLabel: actionLabel ?? (action === 'login' ? '登录 MiQroForge 账号' : '去配置模型'),
     timestamp: Date.now(),
   };
 }
@@ -466,6 +472,43 @@ function createGatewayBlockedMessage(): Message {
       'AI 网关未就绪（平台开通中或不可用），暂时无法发起会话。请到 设置 → MiQroForge 平台 查看网关状态或重新登录后重试。',
     timestamp: Date.now(),
   };
+}
+
+/** 登录失效时的统一拦截文案（发送拦截与流错误路径共用，避免气泡正文与登录按钮语义冲突）。 */
+export const RELOGIN_INTERCEPT_TEXT = 'MiQroForge 平台登录已失效，请重新登录后继续会话。';
+
+/**
+ * 登录失效拦截的消息列表变换（纯函数，便于单测）：
+ *  - 普通发送：乐观 user 气泡按（role + 时间戳）就地替换为重登引导。
+ *    从尾部向前查找——等待 qraft.status() 期间其他监听器（如子代理
+ *    持久事件）可能追加消息，尾部未必是 user 气泡；
+ *  - 恢复中断回合（#740）：无乐观 user 气泡，且 handleResumeTurn 已移除
+ *    中断卡——恢复卡片（resumeMsg）并追加重登引导，避免上下文丢失；
+ *  - 找不到匹配且无恢复卡片（会话已切换等）：原样返回。
+ */
+export function applyReloginIntercept(
+  prev: Message[],
+  userMsg: Message,
+  resumeMsg: Message | null
+): Message[] {
+  let userIndex = -1;
+  for (let i = prev.length - 1; i >= 0; i -= 1) {
+    if (prev[i].role === 'user' && prev[i].timestamp === userMsg.timestamp) {
+      userIndex = i;
+      break;
+    }
+  }
+  if (userIndex >= 0) {
+    return [
+      ...prev.slice(0, userIndex),
+      createProviderConfigMessage(RELOGIN_INTERCEPT_TEXT, 'login'),
+      ...prev.slice(userIndex + 1),
+    ];
+  }
+  if (resumeMsg) {
+    return [...prev, resumeMsg, createProviderConfigMessage(RELOGIN_INTERCEPT_TEXT, 'login')];
+  }
+  return prev;
 }
 
 /* ─── Tracked file from tool hints ───────────────────────────────── */
@@ -2376,6 +2419,7 @@ export function ChatConsole({
   renameVersion,
   onRename,
   onOpenProviderSettings,
+  onOpenQraftSettings,
   onOpenApprovals,
   onWorkspaceLoaded,
   onSessionsChanged,
@@ -2401,10 +2445,21 @@ export function ChatConsole({
    *  refresh the sidebar (which reads titles from the backend). */
   onRename?: () => void;
   onOpenProviderSettings?: () => void;
+  /** #1000: 跳转设置 → MiQroForge 平台（首屏登录卡片次级入口）。 */
+  onOpenQraftSettings?: () => void;
   onOpenApprovals?: () => void;
   onWorkspaceLoaded?: (workspace: string | null) => void;
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
+  // #1000: 首屏登录卡片与发送拦截共用登录态；旧 preload 无 qraft 命名空间时
+  // useQraftStatus 内部兜底为空态（视为未登录）。
+  const { loggedIn, status: qraftStatus } = useQraftStatus();
+  // 流错误路径同步读取最新登录态：handleSend 闭包可能捕获旧值（CodeRabbit #1010）。
+  const loggedInRef = useRef(loggedIn);
+  loggedInRef.current = loggedIn;
+  // 登录已失效（token 刷新失败且未恢复）：流错误路径据此给重登引导而非模型配置指引。
+  const requiresReloginRef = useRef(qraftStatus?.requiresRelogin === true);
+  requiresReloginRef.current = qraftStatus?.requiresRelogin === true;
   // #875 D1（外部评估 P0/A1）：系统包安装的 persist/runtime 失败标记只写在
   // 工具输出里，模型可能摘要掉——用户会误以为「允许并记住」已永久生效。
   // 扫描消息中的失败标记并发 window 事件，由 App 级 toast 呈现（不依赖模型）。
@@ -4065,6 +4120,9 @@ export function ChatConsole({
    *  so the resume request flows through the full send pipeline (listeners,
    *  streaming render) instead of a bare chat.send call. */
   const resumeTurnIdRef = useRef<string | null>(null);
+  // 恢复中断回合时被移除的中断卡：登录失效拦截需恢复它并追加重登引导
+  //（resume 无乐观 user 气泡，否则上下文丢失、登录按钮无处可点）。
+  const resumeRemovedMsgRef = useRef<Message | null>(null);
   /** Per-session send id of the send currently in its pre-stream pending phase
    *  (issue #364).  A session is "pending" while its optimistic bubble waits on
    *  the non-blocking provider check / thread init.  The double-Enter guard
@@ -4088,7 +4146,9 @@ export function ChatConsole({
     const meta = msg.interruptedMeta;
     if (!meta?.turnId) return;
     resumeTurnIdRef.current = meta.turnId;
-    // 移除中断卡——resume 的新回复由流式事件接管渲染
+    // 移除中断卡——resume 的新回复由流式事件接管渲染。卡片暂存 ref：
+    // 若预检被登录失效拦截，需恢复卡片并追加重登引导（applyReloginIntercept）。
+    resumeRemovedMsgRef.current = msg;
     setMessages((prev) => prev.filter((m) => m !== msg));
     handleSendRef.current();
   }, []);
@@ -4266,42 +4326,42 @@ export function ChatConsole({
     // the background.  If it rejects, the send proceeds anyway — the bridge
     // surfaces the underlying runtime error through the stream/error path.
     try {
-      const result = await window.miqi.providers.list();
-      const hasConfiguredProvider = result.providers.some((provider) => provider.configured);
-      if (!hasConfiguredProvider) {
-        // No configured provider — replace the optimistic bubble with the
-        // provider-config guidance.  The send is refused: the user should
-        // configure a provider before sending.  The draft is restored to the
-        // input so they can re-send once configured.  Only touch the composer /
-        // message list if THIS session is still displayed — the user may have
-        // switched away while providers.list was pending, and setInput /
-        // setAttachments / setMessages act on the currently displayed session.
+      // #922/#1000：网关状态先取一次，供「未登录 → 登录引导」与
+      // 「已登录但网关未就绪 → 网关提示」两个分支共用。旧 preload/
+      // smoke mock 无 qraft 命名空间时为 null（视为未登录）。
+      const gatewayStatus =
+        typeof window.miqi.qraft?.status === 'function'
+          ? await window.miqi.qraft.status().catch(() => null)
+          : null;
+      // ── 登录已失效拦截 ──
+      // token 刷新失败且未恢复（requiresRelogin）时拦截发送：把乐观气泡换成
+      // 重登引导（一键登录成功后气泡自动移除）。先于网关门禁/无 provider 判定
+      // —— 失效后网关状态仍是旧快照里的 active，必须优先给出重登指引。
+      // 快照读取失败（qraft.status() 抛错）时回退到订阅状态 refs，拦截不失效。
+      const gatewayLoggedIn = gatewayStatus?.loggedIn ?? loggedInRef.current;
+      const gatewayRequiresRelogin = gatewayStatus?.requiresRelogin ?? requiresReloginRef.current;
+      if (gatewayLoggedIn && gatewayRequiresRelogin) {
         pendingSendIdsRef.current.delete(sendSessionKey);
         streamingBySession.delete(sendSessionKey);
         setSendingFor(sendSessionKey, null);
         if (currentSessionRef.current === sendSessionKey) {
           setStreaming(false);
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (last?.timestamp === userMsg.timestamp) {
-              return [...prev.slice(0, -1), createProviderConfigMessage()];
-            }
-            return prev;
-          });
+          // 恢复中断回合（#740）：无乐观 user 气泡，取回被 handleResumeTurn
+          // 移除的中断卡并追加重登引导；随后复位 ref 防陈旧引用。
+          const resumeRemovedMsg = _resumeId ? resumeRemovedMsgRef.current : null;
+          resumeRemovedMsgRef.current = null;
+          setMessages((prev) => applyReloginIntercept(prev, userMsg, resumeRemovedMsg));
           setInput(text);
           setAttachments(atts);
         }
         return;
       }
-
       // ── #922 AI 网关门禁 ──
       // 登录后网关状态明确非 active（provisioning/failed/disabled）时拒绝发起
       // 会话：把乐观气泡换成网关提示并恢复输入框。未登录 / 平台未下发网关状态
-      // 时放行（与模型面板语义一致）。旧 preload/smoke mock 无 qraft 命名空间则跳过。
-      const gatewayStatus =
-        typeof window.miqi.qraft?.status === 'function'
-          ? await window.miqi.qraft.status().catch(() => null)
-          : null;
+      // 时放行（与模型面板语义一致）。先于无 provider 判定（CodeRabbit #1010）：
+      // 已登录但网关未就绪 + 无 provider 时给网关修复指引，而非泛泛的
+      // 「未配置模型服务」。
       if (
         gatewayStatus?.loggedIn === true &&
         gatewayStatus.aiGateway &&
@@ -4316,6 +4376,54 @@ export function ChatConsole({
             const last = prev[prev.length - 1];
             if (last?.timestamp === userMsg.timestamp) {
               return [...prev.slice(0, -1), createGatewayBlockedMessage()];
+            }
+            return prev;
+          });
+          setInput(text);
+          setAttachments(atts);
+        }
+        return;
+      }
+      const result = await window.miqi.providers.list();
+      // 判定「当前默认模型能否发起会话」而不是「有没有已配置的本地 provider」：
+      // 登录后经平台 AI 网关路由的默认模型不需要任何本地凭据（make_provider
+      // 的网关分支），只看 configured 会把「登录即可用」误拦成「未配置模型
+      // 服务」——用户登录后仍被要求配置模型即由此而来。后端用与运行时同一套
+      // 判定（含网关路由）给出 active_model_resolvable；旧版 bridge 无该字段
+      // 时回退到 configured（保持原行为）。
+      const modelServable =
+        result.active_model_resolvable ?? result.providers.some((provider) => provider.configured);
+      if (!modelServable) {
+        // No servable model — replace the optimistic bubble with the
+        // provider-config guidance.  The send is refused: the user should
+        // configure a provider before sending.  The draft is restored to the
+        // input so they can re-send once configured.  Only touch the composer /
+        // message list if THIS session is still displayed — the user may have
+        // switched away while providers.list was pending, and setInput /
+        // setAttachments / setMessages act on the currently displayed session.
+        // #1000：未登录时没有 Provider 可配置（#835 合规收口后凭据配置已移除），
+        // 拦截气泡直接给出一键登录按钮，登录后经网关自动获得平台内置模型。
+        // 已登录时凭据配置同样不存在，引导落点是「设置 → 模型」选平台内置模型。
+        const guidance =
+          gatewayStatus?.loggedIn === true
+            ? createProviderConfigMessage(
+                '当前默认模型没有可用的模型服务。请到 设置 → 模型 选择平台内置模型后重试。',
+                'open-provider-settings',
+                '去选择模型'
+              )
+            : createProviderConfigMessage(
+                '尚未登录平台账号。登录 MiQroForge 账号后即可使用平台内置模型发起会话，模型调用将经平台 AI 网关转发。',
+                'login'
+              );
+        pendingSendIdsRef.current.delete(sendSessionKey);
+        streamingBySession.delete(sendSessionKey);
+        setSendingFor(sendSessionKey, null);
+        if (currentSessionRef.current === sendSessionKey) {
+          setStreaming(false);
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last?.timestamp === userMsg.timestamp) {
+              return [...prev.slice(0, -1), guidance];
             }
             return prev;
           });
@@ -5266,7 +5374,16 @@ export function ChatConsole({
       setMessages((prev) => [
         ...prev.filter((m) => !m.isLiveReasoning),
         isProviderConfigurationProblem(message, data.code)
-          ? createProviderConfigMessage(message)
+          ? createProviderConfigMessage(
+              requiresReloginRef.current ? RELOGIN_INTERCEPT_TEXT : message,
+              loggedInRef.current && !requiresReloginRef.current
+                ? 'open-provider-settings'
+                : 'login',
+              // 已登录且凭据未失效时：凭据配置入口已不存在（#835 收口），
+              // NO_API_KEY 只可能是当前模型不走平台网关，落点是重选模型
+              // 而非「配置模型」。登录失效时走重登引导，不覆盖其标签。
+              loggedInRef.current && !requiresReloginRef.current ? '去选择模型' : undefined
+            )
           : { role: 'error', content: message, timestamp: Date.now() },
       ]);
       setStreaming(false);
@@ -5464,7 +5581,13 @@ export function ChatConsole({
       }
       const errMsg = sanitizeUiMessage(e?.message ?? String(e ?? '未知错误'));
       if (isProviderConfigurationProblem(errMsg, e?.code)) {
-        setMessages((prev) => [...prev, createProviderConfigMessage(errMsg)]);
+        setMessages((prev) => [
+          ...prev,
+          createProviderConfigMessage(
+            requiresReloginRef.current ? RELOGIN_INTERCEPT_TEXT : errMsg,
+            loggedInRef.current && !requiresReloginRef.current ? 'open-provider-settings' : 'login'
+          ),
+        ]);
       } else if (e?.code) {
         setMessages((prev) => [
           ...prev,
@@ -5931,6 +6054,15 @@ export function ChatConsole({
 
   /** Stable no-arg reload trigger for error bubbles (#570). */
   const retryLoad = useCallback(() => setRetryTick((t) => t + 1), []);
+
+  /** #1000：登录引导气泡内一键登录成功后移除该气泡（用户即可重发消息）。 */
+  const handleLoginGuidanceDone = useCallback(
+    (msg: Message) => {
+      if (currentSessionRef.current !== sessionKey) return; // 已切走：保留给该会话
+      setMessages((prev) => prev.filter((m) => m.timestamp !== msg.timestamp));
+    },
+    [sessionKey]
+  );
 
   // Composer right-click edit menu (剪切/复制/粘贴/全选) — restored from
   // #547 after the #577 rewrite dropped it.
@@ -6673,6 +6805,8 @@ export function ChatConsole({
                     </p>
                     <p className="text-[13px] text-text-muted">先选一种做事方式，再告诉我任务</p>
                   </div>
+                  {/* #1000 首屏登录入口：未登录时欢迎区直接展示登录卡片，不再藏在设置页深处 */}
+                  {!loggedIn && <QraftLoginCard onGoToQraft={onOpenQraftSettings} />}
                   <div className="relative flex gap-[10px] w-full max-w-[560px]">
                     {[
                       {
@@ -6799,6 +6933,7 @@ export function ChatConsole({
                         onRetryLoad={retryLoad}
                         onRegenerate={handleRegenerate}
                         onOpenProviderSettings={onOpenProviderSettings}
+                        onLoginSuccess={handleLoginGuidanceDone}
                         onDownloadPaper={handleDownloadPaper}
                         downloadingPaperId={downloadingPaperId}
                         paperDownloadStates={paperDownloadStates}
@@ -8102,6 +8237,8 @@ interface MessageBubbleProps {
   onRetryLoad?: () => void;
   onRegenerate?: (msg: Message) => void;
   onOpenProviderSettings?: () => void;
+  /** #1000：错误气泡内一键登录成功后移除该引导气泡。 */
+  onLoginSuccess?: (msg: Message) => void;
   onDownloadPaper?: (paper: PaperItem) => void;
   downloadingPaperId?: string | null;
   /** #668 补：论文下载结果反馈（paperId → done/failed） */
@@ -8135,6 +8272,7 @@ const MessageBubble = memo(function MessageBubble({
   onRetryLoad,
   onRegenerate,
   onOpenProviderSettings,
+  onLoginSuccess,
   onDownloadPaper,
   downloadingPaperId,
   paperDownloadStates,
@@ -8588,6 +8726,17 @@ const MessageBubble = memo(function MessageBubble({
               <Settings size={13} />
               {msg.actionLabel ?? '配置 Provider'}
             </button>
+          )}
+          {/* #1000 未登录拦截：错误气泡内直接一键浏览器登录（自管理忙碌/反馈态），
+              登录成功后移除本引导气泡 */}
+          {msg.action === 'login' && (
+            <QraftLoginButton
+              testId="chat-error-login-btn"
+              size="sm"
+              busyLabel="等待授权中…"
+              className="mt-3"
+              onLoggedIn={() => onLoginSuccess?.(msg)}
+            />
           )}
         </div>
       </div>
